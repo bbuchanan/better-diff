@@ -108,6 +108,8 @@ Commit graph, file list, and diff view should have stable positions. Avoid jumpi
 
 The diff pane is the star. Favor readable layout, syntax highlighting, hunk navigation, and collapsed unchanged sections over maximizing information density.
 
+The visual quality bar should be closer to tools like delta than to raw patch output. That means strong color hierarchy, polished file and hunk headers, readable gutters, syntax-aware coloring, and side-by-side layouts that feel designed rather than merely functional.
+
 ### 4.4 Selection drives everything
 
 The entire application should follow a selection-based model:

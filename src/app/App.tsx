@@ -4,6 +4,8 @@ import {Box, Text, useApp, useInput, useStdout} from 'ink';
 import type {
   CommitSummary,
   CompareSelection,
+  ConflictFile,
+  ConflictFileContents,
   DiffStyle,
   ExplorerMode,
   FileChange,
@@ -12,11 +14,14 @@ import type {
 } from '../domain/models.js';
 import {
   GitCommandError,
+  acceptConflictSide,
   discoverRepository,
   getCommitDiff,
+  getConflictFileContents,
   getRangeDiff,
   listCommitFiles,
   listCommits,
+  listConflictFiles,
   listRangeFiles
 } from '../git/client.js';
 import {
@@ -38,7 +43,9 @@ interface DataState {
   repository: RepositoryInfo | null;
   commits: CommitSummary[];
   files: FileChange[];
+  conflictFiles: ConflictFile[];
   diff: string;
+  conflictContents: ConflictFileContents | null;
   repositoryError: string | null;
   filesError: string | null;
   diffError: string | null;
@@ -60,13 +67,22 @@ interface CompareOption {
   run: () => void;
 }
 
+interface ConflictRenderRow {
+  kind: 'section-header' | 'line' | 'blank';
+  text: string;
+  color?: string;
+  lineNumber?: number;
+}
+
 type DiffPresentationMode = 'inline' | 'side-by-side';
 
 const INITIAL_STATE: DataState = {
   repository: null,
   commits: [],
   files: [],
+  conflictFiles: [],
   diff: '',
+  conflictContents: null,
   repositoryError: null,
   filesError: null,
   diffError: null,
@@ -85,10 +101,6 @@ function getErrorMessage(error: unknown): string {
   }
 
   return 'Unknown error';
-}
-
-function sanitizeText(value: string): string {
-  return value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '');
 }
 
 function trimToWidth(value: string, width: number): string {
@@ -131,7 +143,7 @@ function matchesCommit(commit: CommitSummary, query: string): boolean {
   return haystack.includes(query.toLowerCase());
 }
 
-function matchesFile(file: FileChange, query: string): boolean {
+function matchesFile(file: {status: string; path: string; oldPath?: string}, query: string): boolean {
   const haystack = `${file.status} ${file.path} ${file.oldPath ?? ''}`.toLowerCase();
   return haystack.includes(query.toLowerCase());
 }
@@ -165,7 +177,7 @@ function truncateTokens(tokens: TextToken[], width: number): TextToken[] {
 
     if (remaining <= 3) {
       result.push({
-        text: `${token.text.slice(0, remaining)}`
+        text: token.text.slice(0, remaining)
       });
     } else {
       result.push({
@@ -173,6 +185,7 @@ function truncateTokens(tokens: TextToken[], width: number): TextToken[] {
         text: `${token.text.slice(0, remaining - 3)}...`
       });
     }
+
     remaining = 0;
   }
 
@@ -279,10 +292,7 @@ function renderSideCell(
     text: '',
     tokens: [{text: ''}]
   };
-  const lineNumber =
-    side === 'left'
-      ? current.oldLineNumber
-      : current.newLineNumber;
+  const lineNumber = side === 'left' ? current.oldLineNumber : current.newLineNumber;
   const gutter = lineNumber ? String(lineNumber).padStart(gutterWidth, ' ') : ' '.repeat(gutterWidth);
   const contentWidth = Math.max(0, width - gutterWidth - 3);
   const baseColor = getCellBaseColor(current.kind);
@@ -347,6 +357,78 @@ function renderSideBySideRow(
   );
 }
 
+function buildConflictRows(contents: ConflictFileContents | null): ConflictRenderRow[] {
+  if (!contents) {
+    return [];
+  }
+
+  const sections: Array<{title: string; color: string; body?: string}> = [
+    {title: 'BASE', color: 'cyan', body: contents.base},
+    {title: 'OURS', color: 'green', body: contents.ours},
+    {title: 'THEIRS', color: 'red', body: contents.theirs},
+    {title: 'MERGED (working tree)', color: 'yellow', body: contents.merged}
+  ];
+  const rows: ConflictRenderRow[] = [];
+
+  for (const section of sections) {
+    rows.push({
+      kind: 'section-header',
+      text: section.title,
+      color: section.color
+    });
+
+    const lines = (section.body ?? '(not available)').split('\n');
+
+    lines.forEach((line, index) => {
+      rows.push({
+        kind: 'line',
+        text: line,
+        color: section.color,
+        lineNumber: index + 1
+      });
+    });
+
+    rows.push({
+      kind: 'blank',
+      text: ''
+    });
+  }
+
+  return rows;
+}
+
+function renderConflictRow(
+  row: ConflictRenderRow,
+  index: number,
+  width: number,
+  gutterWidth: number
+): React.JSX.Element {
+  if (row.kind === 'blank') {
+    return <Text key={`conflict-${index}`}> </Text>;
+  }
+
+  if (row.kind === 'section-header') {
+    return (
+      <Text key={`conflict-${index}`} color={row.color} bold>
+        {trimToWidth(row.text, width)}
+      </Text>
+    );
+  }
+
+  const lineNumber = row.lineNumber ? String(row.lineNumber).padStart(gutterWidth, ' ') : ' '.repeat(gutterWidth);
+  const contentWidth = Math.max(0, width - gutterWidth - 1);
+  const trimmed = trimToWidth(row.text, contentWidth);
+  const tokens = tokenizeLine(trimmed, 'plain');
+
+  return (
+    <Text key={`conflict-${index}`}>
+      <Text color="gray">{lineNumber}</Text>
+      <Text color="gray"> </Text>
+      {renderTokens(tokens, `conflict-${index}`, row.color)}
+    </Text>
+  );
+}
+
 function PaneFrame(props: {
   title: string;
   focused: boolean;
@@ -375,6 +457,7 @@ function PaneFrame(props: {
 export function App({cwd}: AppProps): React.JSX.Element {
   const {exit} = useApp();
   const {stdout} = useStdout();
+  const [refreshNonce, setRefreshNonce] = useState(0);
   const [data, setData] = useState<DataState>(INITIAL_STATE);
   const [focus, setFocus] = useState<PaneFocus>('commits');
   const [mode, setMode] = useState<ExplorerMode>('history');
@@ -393,12 +476,13 @@ export function App({cwd}: AppProps): React.JSX.Element {
   const [fileQuery, setFileQuery] = useState('');
   const [comparePickerOpen, setComparePickerOpen] = useState(false);
   const [comparePickerIndex, setComparePickerIndex] = useState(0);
+  const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [resolvingConflict, setResolvingConflict] = useState(false);
 
   useEffect(() => {
     let active = true;
 
     async function loadRepository(): Promise<void> {
-      setMode('history');
       setPresetDiffStyle('three-dot');
       setCommitDiffStyle('two-dot');
       setFocus('commits');
@@ -419,17 +503,23 @@ export function App({cwd}: AppProps): React.JSX.Element {
 
       try {
         const repository = await discoverRepository(cwd);
-        const commits = await listCommits(repository.rootPath);
+        const [commits, conflictFiles] = await Promise.all([
+          listCommits(repository.rootPath),
+          listConflictFiles(repository.rootPath)
+        ]);
 
         if (!active) {
           return;
         }
 
+        setMode(conflictFiles.length > 0 ? 'conflict' : 'history');
         setData({
           repository,
           commits,
           files: [],
+          conflictFiles,
           diff: '',
+          conflictContents: null,
           repositoryError: commits.length === 0 ? 'Repository has no commits yet.' : null,
           filesError: null,
           diffError: null,
@@ -455,7 +545,7 @@ export function App({cwd}: AppProps): React.JSX.Element {
     return () => {
       active = false;
     };
-  }, [cwd]);
+  }, [cwd, refreshNonce]);
 
   const filteredCommits = useMemo(
     () => data.commits.filter((commit) => matchesCommit(commit, commitQuery)),
@@ -498,9 +588,12 @@ export function App({cwd}: AppProps): React.JSX.Element {
     return null;
   }, [compareAnchorCommit, commitDiffStyle, data.repository, mode, presetDiffStyle, selectedCommit]);
 
-  const activeSelectionKey = activeComparison
-    ? `${activeComparison.mode}:${activeComparison.leftRef}:${activeComparison.diffStyle}:${activeComparison.rightRef}`
-    : `history:${selectedCommit?.sha ?? 'none'}`;
+  const activeSelectionKey =
+    mode === 'conflict'
+      ? `conflict:${data.conflictFiles.map((file) => file.path).join('|')}`
+      : activeComparison
+        ? `${activeComparison.mode}:${activeComparison.leftRef}:${activeComparison.diffStyle}:${activeComparison.rightRef}`
+        : `history:${selectedCommit?.sha ?? 'none'}`;
 
   useEffect(() => {
     setSelectedFileIndex(0);
@@ -508,15 +601,29 @@ export function App({cwd}: AppProps): React.JSX.Element {
     setActiveHunkIndex(0);
     setData((current) => ({
       ...current,
-      files: [],
+      files: mode === 'conflict' ? current.files : [],
       diff: '',
+      conflictContents: null,
       filesError: null,
       diffError: null
     }));
-  }, [activeSelectionKey]);
+  }, [activeSelectionKey, mode]);
 
   useEffect(() => {
     if (!data.repository) {
+      return;
+    }
+
+    if (mode === 'conflict') {
+      setData((current) => ({
+        ...current,
+        files: current.conflictFiles.map((file) => ({
+          path: file.path,
+          status: file.status
+        })),
+        loadingFiles: false,
+        filesError: current.conflictFiles.length === 0 ? 'No conflicted files remain.' : null
+      }));
       return;
     }
 
@@ -587,7 +694,7 @@ export function App({cwd}: AppProps): React.JSX.Element {
     return () => {
       active = false;
     };
-  }, [activeComparison, commitQuery, data.repository, selectedCommit]);
+  }, [activeComparison, commitQuery, data.repository, mode, selectedCommit]);
 
   const filteredFiles = useMemo(
     () => data.files.filter((file) => matchesFile(file, fileQuery)),
@@ -599,16 +706,74 @@ export function App({cwd}: AppProps): React.JSX.Element {
   }, [filteredFiles.length]);
 
   const selectedFile = filteredFiles[selectedFileIndex] ?? null;
+  const selectedConflict = useMemo(
+    () => (mode === 'conflict' && selectedFile ? data.conflictFiles.find((file) => file.path === selectedFile.path) ?? null : null),
+    [data.conflictFiles, mode, selectedFile]
+  );
 
   useEffect(() => {
     if (!data.repository) {
       return;
     }
 
+    if (mode === 'conflict') {
+      if (!selectedConflict) {
+        setData((current) => ({
+          ...current,
+          conflictContents: null,
+          diff: '',
+          loadingDiff: false,
+          diffError: fileQuery && filteredFiles.length === 0 ? 'No conflicted file matches the current filter.' : null
+        }));
+        return;
+      }
+
+      let active = true;
+      setData((current) => ({
+        ...current,
+        loadingDiff: true,
+        diffError: null
+      }));
+
+      void getConflictFileContents(data.repository.rootPath, selectedConflict.path)
+        .then((contents) => {
+          if (!active) {
+            return;
+          }
+
+          setDiffScroll(0);
+          setData((current) => ({
+            ...current,
+            conflictContents: contents,
+            diff: '',
+            loadingDiff: false,
+            diffError: null
+          }));
+        })
+        .catch((error) => {
+          if (!active) {
+            return;
+          }
+
+          setData((current) => ({
+            ...current,
+            conflictContents: null,
+            diff: '',
+            loadingDiff: false,
+            diffError: getErrorMessage(error)
+          }));
+        });
+
+      return () => {
+        active = false;
+      };
+    }
+
     if (!activeComparison && !selectedCommit) {
       setData((current) => ({
         ...current,
         diff: '',
+        conflictContents: null,
         loadingDiff: false,
         diffError: null
       }));
@@ -619,6 +784,7 @@ export function App({cwd}: AppProps): React.JSX.Element {
       setData((current) => ({
         ...current,
         diff: '',
+        conflictContents: null,
         loadingDiff: false,
         diffError: 'No file matches the current filter.'
       }));
@@ -654,6 +820,7 @@ export function App({cwd}: AppProps): React.JSX.Element {
         setData((current) => ({
           ...current,
           diff,
+          conflictContents: null,
           loadingDiff: false,
           diffError: diff ? null : activeComparison ? 'No diff available for this comparison.' : 'No diff available.'
         }));
@@ -666,6 +833,7 @@ export function App({cwd}: AppProps): React.JSX.Element {
         setData((current) => ({
           ...current,
           diff: '',
+          conflictContents: null,
           loadingDiff: false,
           diffError: getErrorMessage(error)
         }));
@@ -674,36 +842,42 @@ export function App({cwd}: AppProps): React.JSX.Element {
     return () => {
       active = false;
     };
-  }, [activeComparison, contextLines, data.files.length, data.repository, fileQuery, filteredFiles.length, selectedCommit, selectedFile]);
+  }, [activeComparison, contextLines, data.files.length, data.repository, fileQuery, filteredFiles.length, mode, selectedCommit, selectedConflict, selectedFile]);
 
   const parsedDiff = useMemo(() => parseUnifiedDiff(data.diff), [data.diff]);
-  const collapseKeep = 2;
   const inlineRender = useMemo(
-    () => buildInlineRender(parsedDiff, {collapseContext, collapseKeep}),
+    () => buildInlineRender(parsedDiff, {collapseContext, collapseKeep: 2}),
     [collapseContext, parsedDiff]
   );
   const sideBySideRender = useMemo(
-    () => buildSideBySideRender(parsedDiff, {collapseContext, collapseKeep}),
+    () => buildSideBySideRender(parsedDiff, {collapseContext, collapseKeep: 2}),
     [collapseContext, parsedDiff]
   );
-  const activeRender = diffMode === 'inline' ? inlineRender : sideBySideRender;
-
-  useEffect(() => {
-    setActiveHunkIndex((current) => clamp(current, 0, Math.max(0, activeRender.hunkRowIndexes.length - 1)));
-  }, [activeRender.hunkRowIndexes.length]);
-
+  const conflictRows = useMemo(() => buildConflictRows(data.conflictContents), [data.conflictContents]);
   const totalColumns = stdout.columns ?? 120;
   const totalRows = stdout.rows ?? 24;
   const commitWidth = Math.max(36, Math.floor(totalColumns * 0.28));
   const fileWidth = Math.max(28, Math.floor(totalColumns * 0.22));
   const diffWidth = Math.max(52, totalColumns - commitWidth - fileWidth - 10);
-  const diffHeight = Math.max(8, totalRows - (comparePickerOpen || searchState.open ? 16 : 12));
-  const listHeight = Math.max(8, totalRows - (comparePickerOpen || searchState.open ? 18 : 14));
+  const diffHeight = Math.max(8, totalRows - (comparePickerOpen || searchState.open ? 17 : 13));
+  const listHeight = Math.max(8, totalRows - (comparePickerOpen || searchState.open ? 19 : 15));
+  const activeRender = diffMode === 'inline' ? inlineRender : sideBySideRender;
+  const activeDiffRows = mode === 'conflict' ? conflictRows : activeRender.rows;
+
+  useEffect(() => {
+    if (mode !== 'conflict') {
+      setActiveHunkIndex((current) => clamp(current, 0, Math.max(0, activeRender.hunkRowIndexes.length - 1)));
+    }
+  }, [activeRender.hunkRowIndexes.length, mode]);
+
+  const diffWindow = activeDiffRows.slice(diffScroll, diffScroll + diffHeight);
   const commitWindow = createWindow(filteredCommits, selectedCommitIndex, listHeight);
   const fileWindow = createWindow(filteredFiles, selectedFileIndex, listHeight);
-  const diffRows = activeRender.rows;
-  const diffWindow = diffRows.slice(diffScroll, diffScroll + diffHeight);
   const maxLineNumber = useMemo(() => {
+    if (mode === 'conflict') {
+      return conflictRows.reduce((max, row) => Math.max(max, row.lineNumber ?? 0), 0);
+    }
+
     let value = 0;
 
     for (const file of parsedDiff.files) {
@@ -715,16 +889,35 @@ export function App({cwd}: AppProps): React.JSX.Element {
     }
 
     return value;
-  }, [parsedDiff.files]);
+  }, [conflictRows, mode, parsedDiff.files]);
   const gutterWidth = Math.max(3, String(maxLineNumber || 0).length);
-  const activeModeLabel = activeComparison ? `Compare ${formatComparisonSpec(activeComparison)}` : 'History selected commit';
+  const activeModeLabel =
+    mode === 'conflict'
+      ? 'Conflict Mode'
+      : activeComparison
+        ? `Compare ${formatComparisonSpec(activeComparison)}`
+        : 'History selected commit';
   const comparePresetLabel = data.repository?.defaultCompareBase ? `${data.repository.defaultCompareBase}...HEAD` : 'unavailable';
   const hunkLabel =
-    activeRender.hunkRowIndexes.length > 0 ? `${activeHunkIndex + 1}/${activeRender.hunkRowIndexes.length}` : '0/0';
-  const commitTitle = commitQuery
-    ? `Commits (${filteredCommits.length}/${data.commits.length})`
-    : `Commits (${data.commits.length})`;
-  const fileTitle = fileQuery ? `Files (${filteredFiles.length}/${data.files.length})` : `Files (${data.files.length})`;
+    mode === 'conflict'
+      ? '-'
+      : activeRender.hunkRowIndexes.length > 0
+        ? `${activeHunkIndex + 1}/${activeRender.hunkRowIndexes.length}`
+        : '0/0';
+  const commitTitle =
+    mode === 'conflict'
+      ? 'Conflict State'
+      : commitQuery
+        ? `Commits (${filteredCommits.length}/${data.commits.length})`
+        : `Commits (${data.commits.length})`;
+  const fileTitle =
+    mode === 'conflict'
+      ? fileQuery
+        ? `Conflicts (${filteredFiles.length}/${data.conflictFiles.length})`
+        : `Conflicts (${data.conflictFiles.length})`
+      : fileQuery
+        ? `Files (${filteredFiles.length}/${data.files.length})`
+        : `Files (${data.files.length})`;
 
   const compareOptions = useMemo<CompareOption[]>(() => {
     const options: CompareOption[] = [
@@ -809,14 +1002,35 @@ export function App({cwd}: AppProps): React.JSX.Element {
   }, [compareOptions.length]);
 
   const jumpToHunk = (nextIndex: number): void => {
-    if (activeRender.hunkRowIndexes.length === 0) {
+    if (mode === 'conflict' || activeRender.hunkRowIndexes.length === 0) {
       return;
     }
 
     const clamped = clamp(nextIndex, 0, activeRender.hunkRowIndexes.length - 1);
     setActiveHunkIndex(clamped);
-    setDiffScroll(clamp(activeRender.hunkRowIndexes[clamped] - 1, 0, Math.max(0, diffRows.length - diffHeight)));
+    setDiffScroll(clamp(activeRender.hunkRowIndexes[clamped] - 1, 0, Math.max(0, activeDiffRows.length - diffHeight)));
     setFocus('diff');
+  };
+
+  const handleConflictResolution = (side: 'ours' | 'theirs'): void => {
+    if (!data.repository || !selectedConflict || resolvingConflict) {
+      return;
+    }
+
+    setResolvingConflict(true);
+    setActionMessage(`Applying ${side} for ${selectedConflict.path}...`);
+
+    void acceptConflictSide(data.repository.rootPath, selectedConflict.path, side)
+      .then(() => {
+        setActionMessage(`Applied ${side} and staged ${selectedConflict.path}.`);
+        setRefreshNonce((current) => current + 1);
+      })
+      .catch((error) => {
+        setActionMessage(`Conflict action failed: ${getErrorMessage(error)}`);
+      })
+      .finally(() => {
+        setResolvingConflict(false);
+      });
   };
 
   useInput((input, key) => {
@@ -901,22 +1115,37 @@ export function App({cwd}: AppProps): React.JSX.Element {
     if (input === '/') {
       setSearchState({
         open: true,
-        target: focus === 'files' ? 'files' : 'commits'
+        target: focus === 'commits' && mode !== 'conflict' ? 'commits' : 'files'
       });
       return;
     }
 
-    if (input === 'c') {
+    if (input === 'c' && mode !== 'conflict') {
       setComparePickerOpen((current) => !current);
       return;
     }
 
-    if (input === 'g') {
+    if (input === 'g' && mode !== 'conflict') {
       setMode('history');
       return;
     }
 
-    if (input === 'v' && selectedCommit) {
+    if (input === 'r' && mode === 'conflict') {
+      setRefreshNonce((current) => current + 1);
+      return;
+    }
+
+    if (input === '1' && mode === 'conflict') {
+      handleConflictResolution('ours');
+      return;
+    }
+
+    if (input === '2' && mode === 'conflict') {
+      handleConflictResolution('theirs');
+      return;
+    }
+
+    if (input === 'v' && selectedCommit && mode !== 'conflict') {
       if (compareAnchorSha === selectedCommit.sha) {
         setCompareAnchorSha(null);
         if (mode === 'compare-commits') {
@@ -928,13 +1157,17 @@ export function App({cwd}: AppProps): React.JSX.Element {
       return;
     }
 
-    if (input === 'i') {
+    if (input === 'i' && mode !== 'conflict') {
       setDiffMode((current) => (current === 'inline' ? 'side-by-side' : 'inline'));
       return;
     }
 
-    if (input === 'z') {
+    if (input === 'z' && mode !== 'conflict') {
       setCollapseContext((current) => !current);
+      return;
+    }
+
+    if ((input === '-' || input === '=' || input === '+') && mode === 'conflict') {
       return;
     }
 
@@ -982,18 +1215,22 @@ export function App({cwd}: AppProps): React.JSX.Element {
 
     if (input === 'j' || key.downArrow) {
       if (focus === 'commits') {
-        setSelectedCommitIndex((current) => clamp(current + 1, 0, Math.max(0, filteredCommits.length - 1)));
+        if (mode !== 'conflict') {
+          setSelectedCommitIndex((current) => clamp(current + 1, 0, Math.max(0, filteredCommits.length - 1)));
+        }
       } else if (focus === 'files') {
         setSelectedFileIndex((current) => clamp(current + 1, 0, Math.max(0, filteredFiles.length - 1)));
       } else {
-        setDiffScroll((current) => clamp(current + 1, 0, Math.max(0, diffRows.length - diffHeight)));
+        setDiffScroll((current) => clamp(current + 1, 0, Math.max(0, activeDiffRows.length - diffHeight)));
       }
       return;
     }
 
     if (input === 'k' || key.upArrow) {
       if (focus === 'commits') {
-        setSelectedCommitIndex((current) => Math.max(current - 1, 0));
+        if (mode !== 'conflict') {
+          setSelectedCommitIndex((current) => Math.max(current - 1, 0));
+        }
       } else if (focus === 'files') {
         setSelectedFileIndex((current) => Math.max(current - 1, 0));
       } else {
@@ -1013,18 +1250,23 @@ export function App({cwd}: AppProps): React.JSX.Element {
             ? `Repo: ${data.repository.rootPath} | Branch: ${data.repository.headRef}`
             : `Target: ${cwd}`}
         </Text>
-        <Text color={activeComparison ? 'yellow' : 'green'}>{`Mode: ${activeModeLabel}`}</Text>
-        {compareAnchorCommit ? (
+        <Text color={mode === 'conflict' ? 'red' : activeComparison ? 'yellow' : 'green'}>{`Mode: ${activeModeLabel}`}</Text>
+        {compareAnchorCommit && mode !== 'conflict' ? (
           <Text color="gray">{`Anchor: ${compareAnchorCommit.shortSha} ${compareAnchorCommit.subject}`}</Text>
         ) : null}
-        <Text color="gray">
-          {`Keys: h/j/k/l navigate, c compare, / search, i ${diffMode}, z collapse ${collapseContext ? 'on' : 'off'}, [ ] hunk ${hunkLabel}, { } file, +/- context ${contextLines}, q quit`}
-        </Text>
-        {commitQuery ? <Text color="gray">{`Commit filter: ${commitQuery}`}</Text> : null}
-        {fileQuery ? <Text color="gray">{`File filter: ${fileQuery}`}</Text> : null}
-        {!data.repository?.defaultCompareBase ? (
-          <Text color="gray">Default branch compare base not found. Preset compare options will stay limited.</Text>
+        {mode === 'conflict' && data.repository ? (
+          <Text color="gray">
+            {`Repo state: merge ${data.repository.isMergeInProgress ? 'yes' : 'no'}, rebase ${data.repository.isRebaseInProgress ? 'yes' : 'no'}, cherry-pick ${data.repository.isCherryPickInProgress ? 'yes' : 'no'}`}
+          </Text>
         ) : null}
+        <Text color="gray">
+          {mode === 'conflict'
+            ? `Keys: h/j/k/l navigate, / filter conflicts, 1 accept ours, 2 accept theirs, r refresh, q quit`
+            : `Keys: h/j/k/l navigate, c compare, / search, i ${diffMode}, z collapse ${collapseContext ? 'on' : 'off'}, [ ] hunk ${hunkLabel}, { } file, +/- context ${contextLines}, q quit`}
+        </Text>
+        {commitQuery && mode !== 'conflict' ? <Text color="gray">{`Commit filter: ${commitQuery}`}</Text> : null}
+        {fileQuery ? <Text color="gray">{`${mode === 'conflict' ? 'Conflict' : 'File'} filter: ${fileQuery}`}</Text> : null}
+        {actionMessage ? <Text color={actionMessage.includes('failed') ? 'red' : 'yellow'}>{actionMessage}</Text> : null}
       </Box>
 
       {data.repositoryError && !data.repository ? (
@@ -1038,25 +1280,42 @@ export function App({cwd}: AppProps): React.JSX.Element {
       ) : (
         <Box gap={1}>
           <PaneFrame title={commitTitle} focused={focus === 'commits'} width={commitWidth}>
-            {data.loadingRepository ? <Text color="yellow">Loading history...</Text> : null}
-            {!data.loadingRepository && commitWindow.length === 0 ? <Text color="gray">No commits loaded.</Text> : null}
-            {commitWindow.map(({item, index}) => {
-              const refs = item.refs.length > 0 ? ` [${item.refs.join(', ')}]` : '';
-              const prefix = index === selectedCommitIndex ? (item.sha === compareAnchorSha ? '*> ' : '>  ') : item.sha === compareAnchorSha ? '*  ' : '   ';
-              const line = trimToWidth(`${item.shortSha} ${item.subject}${refs}`, commitWidth - 8);
-
-              return (
-                <Text key={item.sha} color={index === selectedCommitIndex ? 'green' : undefined}>
-                  {prefix}
-                  {line}
-                </Text>
-              );
-            })}
-            {selectedCommit ? (
-              <Box marginTop={1} flexDirection="column">
-                <Text color="gray">{`${selectedCommit.authoredAt} by ${selectedCommit.authorName}`}</Text>
+            {mode === 'conflict' ? (
+              <Box flexDirection="column">
+                <Text color="red">{`${data.conflictFiles.length} conflicted file${data.conflictFiles.length === 1 ? '' : 's'} detected`}</Text>
+                <Text color="gray">{data.repository?.isMergeInProgress ? 'Merge in progress.' : 'Conflict state detected outside a merge as well.'}</Text>
+                {selectedConflict ? (
+                  <>
+                    <Text color="gray">{`Selected: ${selectedConflict.path}`}</Text>
+                    <Text color="gray">{`Stages: base ${selectedConflict.hasBase ? 'yes' : 'no'}, ours ${selectedConflict.hasOurs ? 'yes' : 'no'}, theirs ${selectedConflict.hasTheirs ? 'yes' : 'no'}`}</Text>
+                  </>
+                ) : null}
+                <Text color="gray">Use `1` to accept ours or `2` to accept theirs for the selected file.</Text>
+                <Text color="gray">The command stages the chosen version immediately.</Text>
               </Box>
-            ) : null}
+            ) : (
+              <>
+                {data.loadingRepository ? <Text color="yellow">Loading history...</Text> : null}
+                {!data.loadingRepository && commitWindow.length === 0 ? <Text color="gray">No commits loaded.</Text> : null}
+                {commitWindow.map(({item, index}) => {
+                  const refs = item.refs.length > 0 ? ` [${item.refs.join(', ')}]` : '';
+                  const prefix = index === selectedCommitIndex ? (item.sha === compareAnchorSha ? '*> ' : '>  ') : item.sha === compareAnchorSha ? '*  ' : '   ';
+                  const line = trimToWidth(`${item.shortSha} ${item.subject}${refs}`, commitWidth - 8);
+
+                  return (
+                    <Text key={item.sha} color={index === selectedCommitIndex ? 'green' : undefined}>
+                      {prefix}
+                      {line}
+                    </Text>
+                  );
+                })}
+                {selectedCommit ? (
+                  <Box marginTop={1} flexDirection="column">
+                    <Text color="gray">{`${selectedCommit.authoredAt} by ${selectedCommit.authorName}`}</Text>
+                  </Box>
+                ) : null}
+              </>
+            )}
           </PaneFrame>
 
           <PaneFrame title={fileTitle} focused={focus === 'files'} width={fileWidth}>
@@ -1067,7 +1326,7 @@ export function App({cwd}: AppProps): React.JSX.Element {
                 const oldPath = item.oldPath ? ` <- ${item.oldPath}` : '';
                 const line = trimToWidth(`${item.status} ${item.path}${oldPath}`, fileWidth - 6);
                 return (
-                  <Text key={`${item.status}-${item.path}`} color={index === selectedFileIndex ? 'green' : undefined}>
+                  <Text key={`${item.status}-${item.path}`} color={index === selectedFileIndex ? 'green' : item.status === 'U' ? 'red' : undefined}>
                     {index === selectedFileIndex ? '> ' : '  '}
                     {line}
                   </Text>
@@ -1077,23 +1336,29 @@ export function App({cwd}: AppProps): React.JSX.Element {
 
           <PaneFrame
             title={
-              selectedFile
-                ? `Diff: ${selectedFile.path}`
-                : activeComparison
-                  ? `Diff Preview (${formatComparisonSpec(activeComparison)})`
-                  : 'Diff Preview'
+              mode === 'conflict'
+                ? selectedConflict
+                  ? `Conflict: ${selectedConflict.path}`
+                  : 'Conflict Viewer'
+                : selectedFile
+                  ? `Diff: ${selectedFile.path}`
+                  : activeComparison
+                    ? `Diff Preview (${formatComparisonSpec(activeComparison)})`
+                    : 'Diff Preview'
             }
             focused={focus === 'diff'}
             width={diffWidth}
           >
-            {data.loadingDiff ? <Text color="yellow">Loading diff...</Text> : null}
+            {data.loadingDiff ? <Text color="yellow">{mode === 'conflict' ? 'Loading conflict view...' : 'Loading diff...'}</Text> : null}
             {data.diffError && !data.loadingDiff ? <Text color="gray">{data.diffError}</Text> : null}
-            {!data.loadingDiff && diffWindow.length === 0 ? <Text color="gray">No diff loaded.</Text> : null}
+            {!data.loadingDiff && diffWindow.length === 0 ? <Text color="gray">{mode === 'conflict' ? 'No conflict content loaded.' : 'No diff loaded.'}</Text> : null}
             {!data.loadingDiff &&
               diffWindow.map((row, index) =>
-                diffMode === 'inline'
-                  ? renderInlineRow(row as InlineRenderRow, diffScroll + index, gutterWidth, diffWidth - 4)
-                  : renderSideBySideRow(row as SideBySideRenderRow, diffScroll + index, diffWidth - 4, gutterWidth)
+                mode === 'conflict'
+                  ? renderConflictRow(row as ConflictRenderRow, diffScroll + index, diffWidth - 4, gutterWidth)
+                  : diffMode === 'inline'
+                    ? renderInlineRow(row as InlineRenderRow, diffScroll + index, gutterWidth, diffWidth - 4)
+                    : renderSideBySideRow(row as SideBySideRenderRow, diffScroll + index, diffWidth - 4, gutterWidth)
               )}
           </PaneFrame>
         </Box>
@@ -1126,13 +1391,17 @@ export function App({cwd}: AppProps): React.JSX.Element {
             {searchState.target === 'commits' ? commitQuery : fileQuery}
             <Text color="gray">_</Text>
           </Text>
-          <Text color="gray">Type to filter live. Enter closes. Backspace clears. Esc keeps the current filter and closes.</Text>
+          <Text color="gray">Type to filter live. Enter closes. Backspace edits. Esc keeps the current filter and closes.</Text>
         </Box>
       ) : null}
 
       {!comparePickerOpen && !searchState.open ? (
         <Box marginTop={1}>
-          <Text color="gray">{`Preset compare base: ${comparePresetLabel}. Vim motions remain the default navigation model.`}</Text>
+          <Text color="gray">
+            {mode === 'conflict'
+              ? 'Conflict mode activates automatically when unresolved files exist. Vim motions remain the default navigation model.'
+              : `Preset compare base: ${comparePresetLabel}. Vim motions remain the default navigation model.`}
+          </Text>
         </Box>
       ) : null}
     </Box>

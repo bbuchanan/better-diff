@@ -1,7 +1,16 @@
+import {readFile} from 'node:fs/promises';
+import {join, normalize, resolve} from 'node:path';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 
-import type {CommitSummary, DiffStyle, FileChange, RepositoryInfo} from '../domain/models.js';
+import type {
+  CommitSummary,
+  ConflictFile,
+  ConflictFileContents,
+  DiffStyle,
+  FileChange,
+  RepositoryInfo
+} from '../domain/models.js';
 
 const execFileAsync = promisify(execFile);
 const RECORD_SEPARATOR = '\u001e';
@@ -57,6 +66,15 @@ async function revisionExists(cwd: string, revision: string): Promise<boolean> {
   }
 }
 
+async function refExists(cwd: string, revision: string): Promise<boolean> {
+  try {
+    await runGit(['rev-parse', '--verify', revision], cwd);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function discoverDefaultCompareBase(cwd: string, headRef: string): Promise<string | null> {
   const candidates = ['main', 'origin/main', 'master', 'origin/master'];
 
@@ -103,6 +121,27 @@ function toDiffSpecifier(left: string, right: string, diffStyle: DiffStyle): str
   return diffStyle === 'three-dot' ? `${left}...${right}` : `${left}..${right}`;
 }
 
+function resolveWorktreePath(rootPath: string, relativePath: string): string {
+  const normalizedRelativePath = normalize(relativePath);
+  const resolvedPath = resolve(join(rootPath, normalizedRelativePath));
+  const resolvedRoot = resolve(rootPath);
+
+  if (!resolvedPath.startsWith(resolvedRoot)) {
+    throw new Error(`Refusing to read path outside repository root: ${relativePath}`);
+  }
+
+  return resolvedPath;
+}
+
+async function readStageBlob(cwd: string, stage: 1 | 2 | 3, path: string): Promise<string | undefined> {
+  try {
+    const raw = await runGit(['show', `:${stage}:${path}`], cwd);
+    return sanitizeOutput(raw).trimEnd();
+  } catch {
+    return undefined;
+  }
+}
+
 export async function discoverRepository(cwd: string): Promise<RepositoryInfo> {
   const [rootPath, gitDir, headRef] = await Promise.all([
     runGit(['rev-parse', '--show-toplevel'], cwd),
@@ -111,13 +150,21 @@ export async function discoverRepository(cwd: string): Promise<RepositoryInfo> {
   ]);
   const normalizedRootPath = sanitizeOutput(rootPath).trim();
   const normalizedHeadRef = sanitizeOutput(headRef).trim() || 'HEAD';
-  const defaultCompareBase = await discoverDefaultCompareBase(normalizedRootPath, normalizedHeadRef);
+  const [defaultCompareBase, isMergeInProgress, isRebaseInProgress, isCherryPickInProgress] = await Promise.all([
+    discoverDefaultCompareBase(normalizedRootPath, normalizedHeadRef),
+    refExists(normalizedRootPath, 'MERGE_HEAD'),
+    refExists(normalizedRootPath, 'REBASE_HEAD'),
+    refExists(normalizedRootPath, 'CHERRY_PICK_HEAD')
+  ]);
 
   return {
     rootPath: normalizedRootPath,
     gitDir: sanitizeOutput(gitDir).trim(),
     headRef: normalizedHeadRef,
-    defaultCompareBase
+    defaultCompareBase,
+    isMergeInProgress,
+    isRebaseInProgress,
+    isCherryPickInProgress
   };
 }
 
@@ -215,4 +262,68 @@ export async function getRangeDiff(
 
   const raw = await runGit(args, cwd);
   return sanitizeOutput(raw).trimEnd();
+}
+
+export async function listConflictFiles(cwd: string): Promise<ConflictFile[]> {
+  const raw = await runGit(['ls-files', '-u', '-z'], cwd);
+
+  if (!raw) {
+    return [];
+  }
+
+  const conflictsByPath = new Map<string, ConflictFile>();
+
+  for (const entry of raw.split('\0').filter(Boolean)) {
+    const match = /^(\d+)\s+([0-9a-f]+)\s+(\d)\t(.+)$/.exec(entry);
+
+    if (!match) {
+      continue;
+    }
+
+    const stage = Number(match[3]);
+    const path = sanitizeOutput(match[4]);
+    const existing = conflictsByPath.get(path) ?? {
+      path,
+      status: 'U' as const,
+      hasBase: false,
+      hasOurs: false,
+      hasTheirs: false
+    };
+
+    if (stage === 1) {
+      existing.hasBase = true;
+    } else if (stage === 2) {
+      existing.hasOurs = true;
+    } else if (stage === 3) {
+      existing.hasTheirs = true;
+    }
+
+    conflictsByPath.set(path, existing);
+  }
+
+  return [...conflictsByPath.values()].sort((left, right) => left.path.localeCompare(right.path));
+}
+
+export async function getConflictFileContents(cwd: string, path: string): Promise<ConflictFileContents> {
+  const [base, ours, theirs, merged] = await Promise.all([
+    readStageBlob(cwd, 1, path),
+    readStageBlob(cwd, 2, path),
+    readStageBlob(cwd, 3, path),
+    readFile(resolveWorktreePath(cwd, path), 'utf8')
+      .then((contents) => sanitizeOutput(contents).trimEnd())
+      .catch(() => undefined)
+  ]);
+
+  return {
+    path,
+    base,
+    ours,
+    theirs,
+    merged
+  };
+}
+
+export async function acceptConflictSide(cwd: string, path: string, side: 'ours' | 'theirs'): Promise<void> {
+  await runGit(['checkout', `--${side}`, '--', path], cwd);
+  await runGit(['add', '--', path], cwd);
 }
