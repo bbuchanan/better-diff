@@ -387,56 +387,35 @@ Responsible for:
 
 ## 9. Technology Options
 
-## 9.1 Recommended path for MVP: TypeScript + Ink
+## 9.1 Current implementation path: Go + Bubble Tea
 
-Because you are already strongest in TypeScript/React, the fastest route to a real prototype is likely:
+The project is now implemented as:
 
-- **TypeScript**
-- **Node.js** runtime
-- **Ink** for terminal UI
-- **React state model** for composable panes/components
+- **Go**
+- **Bubble Tea** for terminal state/update flow
+- **Lip Gloss** for layout and styling
 - Git via child processes initially
 
 ### Why this path
 
-- shortest time to first usable prototype
-- strong developer ergonomics
-- componentized UI model maps well to panes and overlays
-- easy to build and iterate on selection-driven state
+- better raw performance
+- stronger native-terminal feel
+- easier static distribution, especially on macOS
+- better fit for richer diff rendering and large-repo interaction
 
 ### Risks
 
-- terminal layout/performance under heavy data loads may require discipline
-- commit graph rendering and virtualization could become custom work
-- React in terminal can feel less native if not carefully managed
+- richer rendering still requires custom work
+- graph rendering and virtualization are still non-trivial
+- iteration speed is lower than the original TS prototype path
 
-## 9.2 Alternative path: Go + Bubble Tea
+## 9.2 Retired prototype path: TypeScript + Ink
 
-A stronger long-term TUI platform might be:
-
-- **Go**
-- **Bubble Tea** + Lip Gloss
-
-### Why consider it
-
-- better raw performance
-- stronger native-terminal feel
-- easier static distribution
-- likely better for very large repos and sophisticated rendering
-
-### Why not first
-
-- slower initial development for you
-- larger up-front investment in architecture and iteration
+The React/Ink prototype served its purpose as a UX spike, but it has been retired from the repo after proving too weak on performance for the intended rendering complexity.
 
 ## 9.3 Recommendation
 
-Start with **TypeScript + Ink** for a proof-of-concept and validate the UX.
-
-If the concept proves valuable but performance or rendering constraints become painful, either:
-
-- optimize the TS implementation, or
-- rebuild v2 in Go using the now-validated UX and domain model
+Continue investing in the Go/Bubble Tea implementation and use the earlier TS prototype only as historical product reference, not as a maintained runtime.
 
 ---
 
@@ -991,44 +970,21 @@ Success criteria:
 ## 21. Suggested Project Structure
 
 ```text
-src/
+cmd/
+  better-diff/
+    main.go
+internal/
   app/
-    bootstrap.ts
-    commands/
-    reducers/
-    selectors/
-  ui/
-    components/
-      layout/
-      history/
-      files/
-      diff/
-      overlays/
-    hooks/
-    theme/
+    model.go
   domain/
-    models/
-    services/
-      comparison/
-      graph/
-      diff/
-      conflicts/
+    models.go
   git/
-    client/
-    commands/
-    parsers/
-    adapters/
-  rendering/
-    diff/
-    graph/
-  infra/
-    cache/
-    logging/
-    process/
-  test/
-    fixtures/
-    integration/
-    unit/
+    client.go
+    client_test.go
+  render/
+    diff.go
+    diff_test.go
+bin/
 ```
 
 ---
@@ -1057,7 +1013,7 @@ These should be answered early with prototypes.
 2. How should side-by-side diff handle long lines: wrap, crop, or horizontal scroll?
 3. How much of conflict resolution belongs in v1 versus deferring to editor handoff?
 4. Should compare mode be modal, or should it feel like a persistent dual-selection model?
-5. Is React/Ink fast enough for the intended repos and rendering complexity?
+5. What profiling work is still needed to keep the Go/Bubble Tea build fast on daily-driver repos?
 
 ---
 
