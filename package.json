@@ -1,0 +1,23 @@
+{
+  "name": "better-diff",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Terminal-native Git history and diff explorer prototype.",
+  "scripts": {
+    "dev": "tsx src/index.tsx",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ink": "^6.8.0",
+    "react": "^19.2.4",
+    "react-devtools-core": "^7.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.4.0",
+    "@types/react": "^19.2.14",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
