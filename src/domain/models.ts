@@ -13,6 +13,7 @@ export interface RepositoryInfo {
 }
 
 export interface CommitSummary {
+  graph: string;
   sha: string;
   shortSha: string;
   authoredAt: string;

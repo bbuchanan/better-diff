@@ -1,6 +1,6 @@
 import {readFile} from 'node:fs/promises';
 import {join, normalize, resolve} from 'node:path';
-import {execFile} from 'node:child_process';
+import {execFile, spawn} from 'node:child_process';
 import {promisify} from 'node:util';
 
 import type {
@@ -121,6 +121,49 @@ function toDiffSpecifier(left: string, right: string, diffStyle: DiffStyle): str
   return diffStyle === 'three-dot' ? `${left}...${right}` : `${left}..${right}`;
 }
 
+function parseCommand(command: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+
+  for (const char of command) {
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (current) {
+        parts.push(current);
+        current = '';
+      }
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (current) {
+    parts.push(current);
+  }
+
+  return parts;
+}
+
+function isTerminalEditor(command: string): boolean {
+  const terminalEditors = new Set(['vim', 'nvim', 'vi', 'nano', 'hx', 'helix', 'emacs', 'kak']);
+  return terminalEditors.has(command);
+}
+
 function resolveWorktreePath(rootPath: string, relativePath: string): string {
   const normalizedRelativePath = normalize(relativePath);
   const resolvedPath = resolve(join(rootPath, normalizedRelativePath));
@@ -180,20 +223,25 @@ export async function listCommits(cwd: string, limit = 60): Promise<CommitSummar
   const raw = await runGit(
     [
       'log',
+      '--graph',
       `--max-count=${limit}`,
       '--date=short',
-      `--format=${format}${RECORD_SEPARATOR}`
+      `--format=${FIELD_SEPARATOR}${format}${RECORD_SEPARATOR}`
     ],
     cwd
   );
 
   return raw
     .split(RECORD_SEPARATOR)
-    .map((record) => record.trim())
+    .map((record) => record.replace(/^\n+/, '').replace(/\n$/, ''))
     .filter(Boolean)
     .map((record) => {
-      const [sha, shortSha, authoredAt, authorName, refsRaw, subject] = record.split(FIELD_SEPARATOR);
+      const firstSeparatorIndex = record.indexOf(FIELD_SEPARATOR);
+      const graph = firstSeparatorIndex >= 0 ? record.slice(0, firstSeparatorIndex) : '';
+      const fields = firstSeparatorIndex >= 0 ? record.slice(firstSeparatorIndex + 1).split(FIELD_SEPARATOR) : record.split(FIELD_SEPARATOR);
+      const [sha, shortSha, authoredAt, authorName, refsRaw, subject] = fields;
       return {
+        graph: sanitizeOutput(graph).replace(/\n/g, ''),
         sha: sanitizeOutput(sha),
         shortSha: sanitizeOutput(shortSha),
         authoredAt: sanitizeOutput(authoredAt),
@@ -326,4 +374,40 @@ export async function getConflictFileContents(cwd: string, path: string): Promis
 export async function acceptConflictSide(cwd: string, path: string, side: 'ours' | 'theirs'): Promise<void> {
   await runGit(['checkout', `--${side}`, '--', path], cwd);
   await runGit(['add', '--', path], cwd);
+}
+
+export function openFileInEditor(
+  cwd: string,
+  path: string
+): {mode: 'handoff' | 'background'; command: string} {
+  const editorCommand = process.env.VISUAL || process.env.EDITOR || 'code';
+  const parts = parseCommand(editorCommand);
+  const command = parts[0] ?? 'code';
+  const extraArgs = parts.slice(1);
+  const targetPath = resolveWorktreePath(cwd, path);
+  const isCodeFamily = ['code', 'cursor', 'codium', 'code-insiders'].includes(command);
+  const args = isCodeFamily ? [...extraArgs, '-g', targetPath] : [...extraArgs, targetPath];
+
+  if (isTerminalEditor(command)) {
+    spawn(command, args, {
+      cwd,
+      stdio: 'inherit'
+    });
+    return {
+      mode: 'handoff',
+      command
+    };
+  }
+
+  const child = spawn(command, args, {
+    cwd,
+    detached: true,
+    stdio: 'ignore'
+  });
+  child.unref();
+
+  return {
+    mode: 'background',
+    command
+  };
 }
