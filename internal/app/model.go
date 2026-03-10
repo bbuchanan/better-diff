@@ -100,6 +100,7 @@ type model struct {
 	selectedCommit     int
 	selectedFile       int
 	diffScroll         int
+	diffCursor         int
 	contextLines       int
 	ignoreWhitespace   bool
 	presetDiffStyle    domain.DiffStyle
@@ -124,6 +125,7 @@ type model struct {
 	blameDetailOpen    bool
 
 	diff             string
+	diffLoaded       bool
 	conflictContents *domain.ConflictFileContents
 	loading          bool
 	loadingFiles     bool
@@ -444,20 +446,52 @@ func (m *model) activeComparison() *domain.CompareSelection {
 	return nil
 }
 
+func (m *model) availableRefs() []domain.RefSummary {
+	refs := make([]domain.RefSummary, 0, len(m.refs)+1)
+	refs = append(refs, domain.RefSummary{
+		Name:     "Working Tree",
+		FullName: gitadapter.WorkingTreeRef,
+		Type:     "workspace",
+	})
+	refs = append(refs, m.refs...)
+	return refs
+}
+
 func (m *model) filteredRefs() []domain.RefSummary {
 	query := strings.ToLower(strings.TrimSpace(m.refPickerQuery))
+	refs := m.availableRefs()
+	if m.refPickerStep == 0 {
+		filtered := make([]domain.RefSummary, 0, len(refs))
+		for _, ref := range refs {
+			if ref.FullName == gitadapter.WorkingTreeRef {
+				continue
+			}
+			filtered = append(filtered, ref)
+		}
+		refs = filtered
+	}
 	if query == "" {
-		return m.refs
+		return refs
 	}
 
-	filtered := make([]domain.RefSummary, 0, len(m.refs))
-	for _, ref := range m.refs {
+	filtered := make([]domain.RefSummary, 0, len(refs))
+	for _, ref := range refs {
 		haystack := strings.ToLower(ref.Name + " " + ref.FullName + " " + ref.ShortSHA + " " + ref.Type)
 		if strings.Contains(haystack, query) {
 			filtered = append(filtered, ref)
 		}
 	}
 	return filtered
+}
+
+func compareRefRevision(ref *domain.RefSummary) string {
+	if ref == nil {
+		return ""
+	}
+	if ref.FullName == gitadapter.WorkingTreeRef {
+		return gitadapter.WorkingTreeRef
+	}
+	return ref.Name
 }
 
 func (m *model) selectedRefValue() *domain.RefSummary {
@@ -482,14 +516,18 @@ func (m *model) openRefPicker() {
 		return
 	}
 
-	for index, ref := range m.refs {
+	refs := m.filteredRefs()
+	for _, ref := range refs {
 		if ref.Name == m.repo.HeadRef {
 			copy := ref
 			m.refPickerLeft = &copy
 			m.refPickerStep = 1
-			m.refPickerSelect = index
-			if len(m.refs) > 1 && index == 0 {
-				m.refPickerSelect = 1
+			m.refPickerSelect = 0
+			for candidateIndex, candidate := range m.filteredRefs() {
+				if candidate.FullName == gitadapter.WorkingTreeRef {
+					m.refPickerSelect = candidateIndex
+					break
+				}
 			}
 			return
 		}
@@ -529,8 +567,8 @@ func (m *model) applySelectedRefPickerRef() tea.Cmd {
 	}
 
 	m.customCompare = &domain.CompareSelection{
-		LeftRef:    m.refPickerLeft.Name,
-		RightRef:   m.refPickerRight.Name,
+		LeftRef:    compareRefRevision(m.refPickerLeft),
+		RightRef:   compareRefRevision(m.refPickerRight),
 		LeftLabel:  m.refPickerLeft.Name,
 		RightLabel: m.refPickerRight.Name,
 		DiffStyle:  m.presetDiffStyle,
@@ -643,6 +681,9 @@ func (m *model) leftBlameTarget() *blameTarget {
 		if compare.LeftRef == "" || path == "" {
 			return nil
 		}
+		if compare.LeftRef == gitadapter.WorkingTreeRef {
+			return nil
+		}
 		return &blameTarget{revision: compare.LeftRef, path: path}
 	}
 
@@ -663,7 +704,11 @@ func (m *model) rightBlameTarget() *blameTarget {
 		if compare.RightRef == "" {
 			return nil
 		}
-		return &blameTarget{revision: compare.RightRef, path: file.Path}
+		revision := compare.RightRef
+		if revision == gitadapter.WorkingTreeRef {
+			revision = ""
+		}
+		return &blameTarget{revision: revision, path: file.Path}
 	}
 
 	commit := m.selectedCommitValue()
@@ -741,20 +786,108 @@ func (m *model) blameLineForMeta(meta render.RowMeta) *domain.BlameLine {
 	return nil
 }
 
-func (m *model) currentVisibleBlame(width, height int) *domain.BlameLine {
+func (m *model) currentCursorBlame(width int) *domain.BlameLine {
 	document := m.renderDocument(m.diffRenderWidth(width))
 	if len(document.rows) == 0 {
 		return nil
 	}
 
-	end := minInt(len(document.rows), m.diffScroll+height)
-	for index := m.diffScroll; index < end && index < len(document.rowMeta); index++ {
-		if blame := m.blameLineForMeta(document.rowMeta[index]); blame != nil {
-			return blame
+	if m.diffCursor < 0 || m.diffCursor >= len(document.rowMeta) {
+		return nil
+	}
+	return m.blameLineForMeta(document.rowMeta[m.diffCursor])
+}
+
+func (m *model) currentDiffRowMeta(width int) *render.RowMeta {
+	document := m.renderDocument(m.diffRenderWidth(width))
+	if len(document.rowMeta) == 0 || m.diffCursor < 0 || m.diffCursor >= len(document.rowMeta) {
+		return nil
+	}
+	meta := document.rowMeta[m.diffCursor]
+	return &meta
+}
+
+func diffLineLabel(meta render.RowMeta) string {
+	switch meta.Kind {
+	case render.LineAdd:
+		return "add"
+	case render.LineDelete:
+		return "delete"
+	case render.LineContext:
+		return "context"
+	case render.LineMeta:
+		return "meta"
+	default:
+		if meta.Continuation {
+			return "continued"
+		}
+		return "header"
+	}
+}
+
+func formatLineNumber(value int) string {
+	if value <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d", value)
+}
+
+func (m *model) currentEditorLine(width int) int {
+	meta := m.currentDiffRowMeta(width)
+	if meta == nil {
+		return 0
+	}
+	if meta.NewLine > 0 {
+		return meta.NewLine
+	}
+	return meta.OldLine
+}
+
+func (m *model) currentDiffStatus(width int) string {
+	if !m.diffLoaded {
+		return ""
+	}
+
+	meta := m.currentDiffRowMeta(width)
+	if meta == nil {
+		return ""
+	}
+
+	parts := []string{
+		"line " + diffLineLabel(*meta),
+		"old " + formatLineNumber(meta.OldLine),
+		"new " + formatLineNumber(meta.NewLine),
+	}
+
+	if meta.Continuation {
+		parts = append(parts, "wrapped")
+	}
+
+	if blame := m.blameLineForMeta(*meta); blame != nil {
+		summary := strings.TrimSpace(blameSummary(blame))
+		if summary != "" {
+			parts = append(parts, summary)
 		}
 	}
 
-	return nil
+	status := strings.Join(parts, "  |  ")
+	if width > 0 {
+		status = trimToWidth(status, width)
+	}
+	return status
+}
+
+func (m *model) emptyDiffMessage() string {
+	if m.loadingDiff {
+		return "Loading diff..."
+	}
+	if !m.diffLoaded {
+		return "No diff loaded."
+	}
+	if m.ignoreWhitespace {
+		return "No visible changes for this file with whitespace ignored. Press w to show whitespace changes."
+	}
+	return "No visible changes for this file in the current selection."
 }
 
 func blameSummary(blame *domain.BlameLine) string {
@@ -785,6 +918,64 @@ func renderBlameSeparator(summary string, width int) string {
 	}
 	fillWidth := maxInt(0, width-lipgloss.Width(label))
 	return styleMuted.Render(label + strings.Repeat("─", fillWidth))
+}
+
+func (m *model) blameSummaryBefore(document renderedDiff, start int) (string, bool) {
+	for index := minInt(start-1, len(document.rowMeta)-1); index >= 0; index-- {
+		if blame := m.blameLineForMeta(document.rowMeta[index]); blame != nil {
+			summary := blameSummary(blame)
+			if summary != "" {
+				return summary, true
+			}
+		}
+	}
+	return "", false
+}
+
+func (m *model) renderedLineCount(document renderedDiff, start, end int) int {
+	if start < 0 {
+		start = 0
+	}
+	if end >= len(document.rows) {
+		end = len(document.rows) - 1
+	}
+	if start > end || len(document.rows) == 0 {
+		return 0
+	}
+
+	lastSummary, hasLastSummary := m.blameSummaryBefore(document, start)
+	count := 0
+	for index := start; index <= end; index++ {
+		if index < len(document.rowMeta) {
+			if blame := m.blameLineForMeta(document.rowMeta[index]); blame != nil {
+				summary := blameSummary(blame)
+				if summary != "" && (!hasLastSummary || summary != lastSummary) {
+					count++
+					lastSummary = summary
+					hasLastSummary = true
+				}
+			}
+		}
+		count++
+	}
+	return count
+}
+
+func (m *model) diffViewportStart(document renderedDiff, height int) int {
+	if len(document.rows) == 0 || height <= 0 {
+		return 0
+	}
+
+	maxStart := maxInt(0, len(document.rows)-1)
+	start := clampInt(m.diffCursor-height/2, 0, maxStart)
+	if !m.showBlame {
+		return clampInt(start, 0, maxInt(0, len(document.rows)-height))
+	}
+
+	for start < m.diffCursor && m.renderedLineCount(document, start, m.diffCursor) > height {
+		start++
+	}
+	return clampInt(start, 0, maxStart)
 }
 
 func (m *model) commitBySHA(sha string) *domain.CommitSummary {
@@ -875,6 +1066,60 @@ func (m *model) renderDocument(width int) renderedDiff {
 	return rendered
 }
 
+func (m *model) currentDiffViewportHeight() int {
+	headerLines := 4
+	if m.actionMessage != "" {
+		headerLines++
+	}
+
+	contentHeight := m.height - headerLines - 2
+	if m.paletteOpen {
+		contentHeight -= 9
+	}
+	if m.commitPickerOpen {
+		contentHeight -= 12
+	}
+	if m.blameDetailOpen {
+		contentHeight -= 7
+	}
+	if m.refPickerOpen {
+		contentHeight -= 12
+	}
+	if contentHeight < 12 {
+		contentHeight = 12
+	}
+	return maxInt(1, contentHeight-3)
+}
+
+func (m *model) syncDiffCursor(width int) renderedDiff {
+	document := m.renderDocument(width)
+	rowCount := len(document.rows)
+	if rowCount == 0 {
+		m.diffCursor = 0
+		m.diffScroll = 0
+		return document
+	}
+
+	m.diffCursor = clampInt(m.diffCursor, 0, rowCount-1)
+	viewportHeight := m.currentDiffViewportHeight()
+	targetScroll := m.diffCursor - viewportHeight/2
+	maxScroll := maxInt(0, rowCount-viewportHeight)
+	m.diffScroll = clampInt(targetScroll, 0, maxScroll)
+	return document
+}
+
+func (m *model) moveDiffCursor(delta int, width int) {
+	document := m.renderDocument(width)
+	if len(document.rows) == 0 {
+		m.diffCursor = 0
+		m.diffScroll = 0
+		return
+	}
+
+	m.diffCursor = clampInt(m.diffCursor+delta, 0, len(document.rows)-1)
+	m.syncDiffCursor(width)
+}
+
 func (m *model) jumpToHunk(direction int, width int) {
 	if m.diff == "" || width <= 0 {
 		return
@@ -887,22 +1132,26 @@ func (m *model) jumpToHunk(direction int, width int) {
 
 	if direction > 0 {
 		for _, row := range document.hunkRows {
-			if row > m.diffScroll {
-				m.diffScroll = row
+			if row > m.diffCursor {
+				m.diffCursor = row
+				m.syncDiffCursor(width)
 				return
 			}
 		}
-		m.diffScroll = document.hunkRows[len(document.hunkRows)-1]
+		m.diffCursor = document.hunkRows[len(document.hunkRows)-1]
+		m.syncDiffCursor(width)
 		return
 	}
 
 	for index := len(document.hunkRows) - 1; index >= 0; index-- {
-		if document.hunkRows[index] < m.diffScroll {
-			m.diffScroll = document.hunkRows[index]
+		if document.hunkRows[index] < m.diffCursor {
+			m.diffCursor = document.hunkRows[index]
+			m.syncDiffCursor(width)
 			return
 		}
 	}
-	m.diffScroll = document.hunkRows[0]
+	m.diffCursor = document.hunkRows[0]
+	m.syncDiffCursor(width)
 }
 
 func (m *model) currentSelectionLabel() string {
@@ -926,9 +1175,9 @@ func (m *model) currentSelectionLabel() string {
 	}
 
 	if m.ignoreWhitespace {
-		return "History selected commit [ignore ws]"
+		return "History (selected commit) [ignore ws]"
 	}
-	return "History selected commit"
+	return "History (selected commit)"
 }
 
 func (m *model) refreshFiles() tea.Cmd {
@@ -939,8 +1188,10 @@ func (m *model) refreshFiles() tea.Cmd {
 	m.filesErr = ""
 	m.diffErr = ""
 	m.diff = ""
+	m.diffLoaded = false
 	m.conflictContents = nil
 	m.diffScroll = 0
+	m.diffCursor = 0
 	m.selectedFile = 0
 
 	if m.mode == domain.ModeConflict {
@@ -994,8 +1245,10 @@ func (m *model) refreshDiff() tea.Cmd {
 	m.loadingDiff = true
 	m.diffErr = ""
 	m.diff = ""
+	m.diffLoaded = false
 	m.conflictContents = nil
 	m.diffScroll = 0
+	m.diffCursor = 0
 
 	cacheKey := m.currentDiffCacheKey()
 	if cacheKey != "" {
@@ -1009,6 +1262,7 @@ func (m *model) refreshDiff() tea.Cmd {
 		} else if cached, ok := m.diffCache[cacheKey]; ok {
 			m.loadingDiff = false
 			m.diff = cached
+			m.diffLoaded = true
 			return m.maybeLoadBlame()
 		}
 	}
@@ -1131,13 +1385,18 @@ func (m *model) openSelectedFileInEditor() tea.Cmd {
 		return nil
 	}
 
-	command, err := gitadapter.OpenFileInEditor(m.repo.RootPath, file.Path)
+	line := m.currentEditorLine(m.currentDiffContentWidth())
+	command, err := gitadapter.OpenFileInEditor(m.repo.RootPath, file.Path, line)
 	if err != nil {
 		m.actionMessage = err.Error()
 		return nil
 	}
 
-	m.actionMessage = "Opened in " + command + "."
+	if line > 0 {
+		m.actionMessage = fmt.Sprintf("Opened in %s at line %d.", command, line)
+	} else {
+		m.actionMessage = "Opened in " + command + "."
+	}
 	return nil
 }
 
@@ -1391,6 +1650,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.diffCache[msg.key] = msg.diff
 		if msg.key == m.currentDiffCacheKey() {
 			m.diff = msg.diff
+			m.diffLoaded = true
 		}
 		return m, nil
 	case actionDoneMsg:
@@ -1594,7 +1854,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Batch(m.refreshDiff(), m.prefetchNeighborDiffs())
 				}
 			case focusDiff:
-				m.diffScroll++
+				m.moveDiffCursor(1, m.currentDiffContentWidth())
 			}
 			return m, nil
 		case "k", "up":
@@ -1610,9 +1870,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Batch(m.refreshDiff(), m.prefetchNeighborDiffs())
 				}
 			case focusDiff:
-				if m.diffScroll > 0 {
-					m.diffScroll--
-				}
+				m.moveDiffCursor(-1, m.currentDiffContentWidth())
 			}
 			return m, nil
 		case "]":
@@ -1808,9 +2066,9 @@ func (m *model) diffRenderWidth(totalWidth int) int {
 
 func (m *model) keyHelp() string {
 	if m.mode == domain.ModeConflict {
-		return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, w whitespace, B blame, K blame detail, : palette, b refs, i layout (%s), [ ] hunks, 1 ours, 2 theirs, r refresh, q quit", m.diffLayout)
+		return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, w whitespace, B blame, K blame detail, : palette, b refs, i layout (%s), [ ] hunks, o editor line, 1 ours, 2 theirs, r refresh, q quit", m.diffLayout)
 	}
-	return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, enter file compare, w whitespace, B blame, K blame detail, : palette, b refs, i layout (%s), [ ] hunks, c compare, v anchor compare, g history, +/- context %d, o editor, r refresh, q quit", m.diffLayout, m.contextLines)
+	return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, enter file compare, w whitespace, B blame, K blame detail, : palette, b refs, i layout (%s), [ ] hunks, c compare, v anchor compare, g history, +/- context %d, o editor line, r refresh, q quit", m.diffLayout, m.contextLines)
 }
 
 func (m *model) renderCommitsPane(width, height int) string {
@@ -1920,13 +2178,13 @@ func (m *model) renderCommitPicker(width, height int) string {
 }
 
 func (m *model) renderBlameDetail(width, height int) string {
-	blame := m.currentVisibleBlame(width-2, maxInt(1, m.height-8))
+	blame := m.currentCursorBlame(width - 2)
 	lines := []string{
 		styleAccent.Render("Inline Blame"),
 	}
 
 	if blame == nil {
-		lines = append(lines, styleMuted.Render("No blamed diff line is visible right now. Scroll to a content line and press K again."))
+		lines = append(lines, styleMuted.Render("No blamed diff line is selected right now. Move the diff cursor to a content line and press K again."))
 	} else {
 		lines = append(lines,
 			styleMuted.Render("Author: "+blame.AuthorName),
@@ -2036,6 +2294,9 @@ func (m *model) renderFilesPane(width, height int) string {
 func (m *model) renderDiffPane(width, height int) string {
 	lines := []string{}
 	title := "Diff [" + string(m.diffLayout) + "]"
+	if m.focus == focusDiff {
+		title += " [j/k selects line]"
+	}
 	if m.loadingDiff {
 		lines = append(lines, styleAccent.Render("Loading diff..."))
 	}
@@ -2046,7 +2307,11 @@ func (m *model) renderDiffPane(width, height int) string {
 	if m.mode == domain.ModeConflict {
 		lines = append(lines, m.renderConflictContents(width-4)...)
 	} else {
-		lines = append(lines, m.renderDiffLines(width-4, height-3)...)
+		status := m.currentDiffStatus(width - 4)
+		if status != "" {
+			lines = append(lines, styleCursorInfo.Width(width-4).Render(status))
+		}
+		lines = append(lines, m.renderDiffLines(width-4, maxInt(1, height-3-len(lines)))...)
 	}
 
 	if file := m.selectedFileValue(); file != nil {
@@ -2116,36 +2381,30 @@ func (m *model) renderCommitLine(commit domain.CommitSummary, selected bool, wid
 
 func (m *model) renderDiffLines(width, height int) []string {
 	if m.diff == "" {
-		return []string{styleMuted.Render("No diff loaded.")}
+		return []string{styleMuted.Render(m.emptyDiffMessage())}
 	}
 
-	document := m.renderDocument(width)
-	if m.diffScroll > len(document.rows)-1 {
-		m.diffScroll = maxInt(0, len(document.rows)-1)
-	}
+	document := m.syncDiffCursor(width)
+	start := m.diffViewportStart(document, height)
+	m.diffScroll = start
 
 	if !m.showBlame {
-		end := minInt(len(document.rows), m.diffScroll+height)
-		return document.rows[m.diffScroll:end]
+		end := minInt(len(document.rows), start+height)
+		lines := make([]string, 0, end-start)
+		for index := start; index < end; index++ {
+			row := document.rows[index]
+			if index == m.diffCursor {
+				row = styleSelectedDiffLine.Width(width).Render(row)
+			}
+			lines = append(lines, row)
+		}
+		return lines
 	}
 
 	lines := make([]string, 0, height)
-	lastSummary := ""
-	hasLastSummary := false
-	if m.diffScroll > 0 {
-		for index := m.diffScroll - 1; index >= 0; index-- {
-			if index >= len(document.rowMeta) {
-				continue
-			}
-			if blame := m.blameLineForMeta(document.rowMeta[index]); blame != nil {
-				lastSummary = blameSummary(blame)
-				hasLastSummary = true
-				break
-			}
-		}
-	}
+	lastSummary, hasLastSummary := m.blameSummaryBefore(document, start)
 
-	for index := m.diffScroll; index < len(document.rows) && len(lines) < height; index++ {
+	for index := start; index < len(document.rows) && len(lines) < height; index++ {
 		meta := render.RowMeta{}
 		if index < len(document.rowMeta) {
 			meta = document.rowMeta[index]
@@ -2162,7 +2421,11 @@ func (m *model) renderDiffLines(width, height int) []string {
 				}
 			}
 		}
-		lines = append(lines, document.rows[index])
+		row := document.rows[index]
+		if index == m.diffCursor {
+			row = styleSelectedDiffLine.Width(width).Render(row)
+		}
+		lines = append(lines, row)
 	}
 
 	return lines
@@ -2252,6 +2515,11 @@ var (
 				Foreground(lipgloss.Color("230")).
 				Background(lipgloss.Color("24")).
 				Bold(true)
+	styleCursorInfo = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("250")).
+			Background(lipgloss.Color("237"))
+	styleSelectedDiffLine = lipgloss.NewStyle().
+				Background(lipgloss.Color("236"))
 )
 
 func trimToWidth(value string, width int) string {

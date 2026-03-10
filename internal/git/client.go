@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 const (
 	recordSeparator = '\x1e'
 	fieldSeparator  = '\x1f'
+	WorkingTreeRef  = "__WORKTREE__"
 )
 
 type CommandError struct {
@@ -307,6 +309,29 @@ func diffSpecifier(left, right string, style domain.DiffStyle) string {
 	return left + ".." + right
 }
 
+func isWorkingTreeRef(revision string) bool {
+	return revision == WorkingTreeRef
+}
+
+func appendDiffRange(args []string, left, right string, style domain.DiffStyle) []string {
+	switch {
+	case isWorkingTreeRef(left) && isWorkingTreeRef(right):
+		return args
+	case isWorkingTreeRef(right):
+		if left != "" && !isWorkingTreeRef(left) {
+			return append(args, left)
+		}
+		return args
+	case isWorkingTreeRef(left):
+		if right != "" && !isWorkingTreeRef(right) {
+			return append(args, right)
+		}
+		return args
+	default:
+		return append(args, diffSpecifier(left, right, style))
+	}
+}
+
 func ListRangeFiles(ctx context.Context, cwd, left, right string, style domain.DiffStyle) ([]domain.FileChange, error) {
 	return ListRangeFilesWithOptions(ctx, cwd, left, right, style, false)
 }
@@ -316,7 +341,7 @@ func ListRangeFilesWithOptions(ctx context.Context, cwd, left, right string, sty
 	if ignoreWhitespace {
 		args = append(args, "-w")
 	}
-	args = append(args, diffSpecifier(left, right, style))
+	args = appendDiffRange(args, left, right, style)
 
 	raw, err := runGit(ctx, cwd, args...)
 	if err != nil {
@@ -357,7 +382,7 @@ func GetRangeDiffWithOptions(ctx context.Context, cwd, left, right string, style
 	if ignoreWhitespace {
 		args = append(args, "-w")
 	}
-	args = append(args, diffSpecifier(left, right, style))
+	args = appendDiffRange(args, left, right, style)
 	if path != "" {
 		args = append(args, "--", path)
 	}
@@ -553,7 +578,40 @@ func AcceptConflictSide(ctx context.Context, cwd, path, side string) error {
 	return nil
 }
 
-func OpenFileInEditor(cwd, path string) (string, error) {
+func buildEditorInvocation(editor, targetPath string, line int) (string, []string, error) {
+	parts := strings.Fields(editor)
+	if len(parts) == 0 {
+		return "", nil, errors.New("editor command is empty")
+	}
+
+	command := parts[0]
+	args := parts[1:]
+	name := filepath.Base(command)
+
+	switch name {
+	case "code", "cursor", "codium", "code-insiders":
+		location := targetPath
+		if line > 0 {
+			location = fmt.Sprintf("%s:%d", targetPath, line)
+		}
+		args = append(args, "-g", location)
+	case "vim", "nvim", "vi", "nano":
+		if line > 0 {
+			args = append(args, "+"+strconv.Itoa(line))
+		}
+		args = append(args, targetPath)
+	default:
+		location := targetPath
+		if line > 0 && (name == "subl" || name == "mate" || name == "zed") {
+			location = fmt.Sprintf("%s:%d", targetPath, line)
+		}
+		args = append(args, location)
+	}
+
+	return command, args, nil
+}
+
+func OpenFileInEditor(cwd, path string, line int) (string, error) {
 	editor := os.Getenv("VISUAL")
 	if editor == "" {
 		editor = os.Getenv("EDITOR")
@@ -567,17 +625,9 @@ func OpenFileInEditor(cwd, path string) (string, error) {
 		return "", err
 	}
 
-	parts := strings.Fields(editor)
-	if len(parts) == 0 {
-		return "", errors.New("editor command is empty")
-	}
-
-	command := parts[0]
-	args := parts[1:]
-	if command == "code" || command == "cursor" || command == "codium" || command == "code-insiders" {
-		args = append(args, "-g", targetPath)
-	} else {
-		args = append(args, targetPath)
+	command, args, err := buildEditorInvocation(editor, targetPath, line)
+	if err != nil {
+		return "", err
 	}
 
 	cmd := exec.Command(command, args...)

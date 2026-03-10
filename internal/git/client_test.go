@@ -204,3 +204,63 @@ func TestIgnoreWhitespaceOptions(t *testing.T) {
 		t.Fatalf("expected empty diff with whitespace ignore, got %q", diff)
 	}
 }
+
+func TestBuildEditorInvocation(t *testing.T) {
+	command, args, err := buildEditorInvocation("code --reuse-window", "/tmp/demo.go", 42)
+	if err != nil {
+		t.Fatalf("buildEditorInvocation(code) returned error: %v", err)
+	}
+	if got, want := command, "code"; got != want {
+		t.Fatalf("command = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(args, " "), "--reuse-window -g /tmp/demo.go:42"; got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+
+	command, args, err = buildEditorInvocation("nvim", "/tmp/demo.go", 17)
+	if err != nil {
+		t.Fatalf("buildEditorInvocation(nvim) returned error: %v", err)
+	}
+	if got, want := command, "nvim"; got != want {
+		t.Fatalf("command = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(args, " "), "+17 /tmp/demo.go"; got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestWorkingTreeRangeDiff(t *testing.T) {
+	repo := t.TempDir()
+	runTestGit(t, repo, "init")
+	runTestGit(t, repo, "config", "user.name", "Test User")
+	runTestGit(t, repo, "config", "user.email", "test@example.com")
+
+	if err := os.WriteFile(filepath.Join(repo, "demo.txt"), []byte("alpha\nbeta\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runTestGit(t, repo, "add", "demo.txt")
+	runTestGit(t, repo, "commit", "-m", "initial")
+
+	if err := os.WriteFile(filepath.Join(repo, "demo.txt"), []byte("alpha\nbeta\nworktree\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	ctx, cancel := Context(5 * time.Second)
+	defer cancel()
+
+	files, err := ListRangeFilesWithOptions(ctx, repo, "HEAD", WorkingTreeRef, domain.DiffTwoDot, false)
+	if err != nil {
+		t.Fatalf("ListRangeFilesWithOptions(worktree) returned error: %v", err)
+	}
+	if len(files) != 1 || files[0].Path != "demo.txt" {
+		t.Fatalf("unexpected working tree files: %+v", files)
+	}
+
+	diff, err := GetRangeDiffWithOptions(ctx, repo, "HEAD", WorkingTreeRef, domain.DiffTwoDot, "demo.txt", 3, false)
+	if err != nil {
+		t.Fatalf("GetRangeDiffWithOptions(worktree) returned error: %v", err)
+	}
+	if !strings.Contains(diff, "+worktree") {
+		t.Fatalf("expected working tree diff to contain uncommitted line, got %q", diff)
+	}
+}
