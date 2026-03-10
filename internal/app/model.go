@@ -2057,53 +2057,61 @@ func (m *model) renderDiffPane(width, height int) string {
 }
 
 func (m *model) renderCommitLine(commit domain.CommitSummary, selected bool, width int) string {
-	anchor := ""
+	if width <= 0 {
+		return ""
+	}
+
+	graphPlain := commit.Graph
 	if m.compareAnchor == commit.SHA {
-		anchor = "*"
-	}
-
-	lead := commit.Graph
-	if anchor != "" {
-		if lead != "" {
-			lead = anchor + " " + lead
+		if graphPlain != "" {
+			graphPlain = "• " + graphPlain
 		} else {
-			lead = anchor
+			graphPlain = "•"
 		}
 	}
 
-	baseWidth := lipgloss.Width(lead)
-	if lead != "" {
-		baseWidth++
-	}
-	baseWidth += lipgloss.Width(commit.ShortSHA) + 1
-	subjectWidth := width - baseWidth
-	if subjectWidth < 8 {
-		subjectWidth = 8
+	graphRendered := renderGraphLead(graphPlain, selected)
+	graphWidth := lipgloss.Width(graphPlain)
+	if graphWidth > 0 {
+		graphRendered += " "
+		graphWidth++
 	}
 
-	subject := trimToWidth(commit.Subject, subjectWidth)
+	shaRendered := styleSHA.Render(commit.ShortSHA)
 	if selected {
-		lineParts := []string{}
-		if lead != "" {
-			lineParts = append(lineParts, lead)
-		}
-		lineParts = append(lineParts, commit.ShortSHA, subject)
-		line := strings.Join(lineParts, " ")
-		return styleSelectedCommit.Width(width).Render(trimToWidth(line, width))
+		shaRendered = styleSelectedSHA.Render(commit.ShortSHA)
+	}
+	shaWidth := lipgloss.Width(commit.ShortSHA)
+
+	badgesRendered, badgesWidth := renderRefBadges(commit.Refs, maxInt(0, width/3), selected)
+
+	subjectBudget := width - graphWidth - shaWidth - 1
+	if badgesWidth > 0 {
+		subjectBudget -= badgesWidth + 1
+	}
+	if subjectBudget < 12 && badgesWidth > 0 {
+		badgesRendered = ""
+		badgesWidth = 0
+		subjectBudget = width - graphWidth - shaWidth - 1
+	}
+	subjectBudget = maxInt(8, subjectBudget)
+	subject := trimToWidth(commit.Subject, subjectBudget)
+
+	parts := []string{}
+	if graphRendered != "" {
+		parts = append(parts, graphRendered)
+	}
+	parts = append(parts, shaRendered, " "+subject)
+	if badgesRendered != "" {
+		parts = append(parts, " ", badgesRendered)
 	}
 
-	parts := []string{
-		styleSHA.Render(commit.ShortSHA),
-		" " + subject,
+	line := lipgloss.JoinHorizontal(lipgloss.Left, parts...)
+	line = lipgloss.NewStyle().Width(width).MaxWidth(width).Render(line)
+	if selected {
+		return styleSelectedCommit.Render(line)
 	}
-	if commit.Graph != "" {
-		parts = append([]string{styleGraph.Render(commit.Graph + " ")}, parts...)
-	}
-	if anchor != "" {
-		parts = append([]string{styleMuted.Render(anchor + " ")}, parts...)
-	}
-
-	return lipgloss.JoinHorizontal(lipgloss.Left, parts...)
+	return line
 }
 
 func (m *model) renderDiffLines(width, height int) []string {
@@ -2222,12 +2230,25 @@ var (
 	styleError          = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
 	styleDefault        = lipgloss.NewStyle()
 	styleGraph          = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	styleGraphLane      = lipgloss.NewStyle().Foreground(lipgloss.Color("37"))
+	styleGraphNode      = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+	styleAnchor         = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 	styleSHA            = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
+	styleRefHead        = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("25")).Bold(true)
+	styleRefBranch      = lipgloss.NewStyle().Foreground(lipgloss.Color("153")).Background(lipgloss.Color("237"))
+	styleRefTag         = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("60"))
 	styleSelectedCommit = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("230")).
 				Background(lipgloss.Color("25")).
 				Bold(true)
-	styleSelectedFile = lipgloss.NewStyle().
+	styleSelectedGraphLane = lipgloss.NewStyle().Foreground(lipgloss.Color("195")).Background(lipgloss.Color("25"))
+	styleSelectedGraphNode = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("25")).Bold(true)
+	styleSelectedAnchor    = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("25")).Bold(true)
+	styleSelectedSHA       = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("25")).Bold(true)
+	styleSelectedRefHead   = lipgloss.NewStyle().Foreground(lipgloss.Color("25")).Background(lipgloss.Color("230")).Bold(true)
+	styleSelectedRefBranch = lipgloss.NewStyle().Foreground(lipgloss.Color("25")).Background(lipgloss.Color("195"))
+	styleSelectedRefTag    = lipgloss.NewStyle().Foreground(lipgloss.Color("25")).Background(lipgloss.Color("229"))
+	styleSelectedFile      = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("230")).
 				Background(lipgloss.Color("24")).
 				Bold(true)
@@ -2309,4 +2330,91 @@ func renderInlineRefs(refs []string) string {
 	}
 
 	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+func renderGraphLead(graph string, selected bool) string {
+	if graph == "" {
+		return ""
+	}
+
+	var builder strings.Builder
+	for _, r := range graph {
+		switch r {
+		case '*':
+			if selected {
+				builder.WriteString(styleSelectedGraphNode.Render("●"))
+			} else {
+				builder.WriteString(styleGraphNode.Render("●"))
+			}
+		case '•':
+			if selected {
+				builder.WriteString(styleSelectedAnchor.Render("•"))
+			} else {
+				builder.WriteString(styleAnchor.Render("•"))
+			}
+		case '|', '/', '\\', '_':
+			if selected {
+				builder.WriteString(styleSelectedGraphLane.Render(string(r)))
+			} else {
+				builder.WriteString(styleGraphLane.Render(string(r)))
+			}
+		default:
+			builder.WriteRune(r)
+		}
+	}
+	return builder.String()
+}
+
+func renderRefBadges(refs []string, budget int, selected bool) (string, int) {
+	if len(refs) == 0 || budget <= 0 {
+		return "", 0
+	}
+
+	rendered := make([]string, 0, len(refs))
+	used := 0
+	for _, ref := range refs {
+		label := strings.TrimSpace(ref)
+		if label == "" {
+			continue
+		}
+
+		badge := refBadgeStyle(label, selected).Render(" " + label + " ")
+		width := lipgloss.Width(badge)
+		if len(rendered) > 0 {
+			width++
+		}
+		if used+width > budget {
+			break
+		}
+		if len(rendered) > 0 {
+			used++
+		}
+		rendered = append(rendered, badge)
+		used += lipgloss.Width(badge)
+	}
+
+	if len(rendered) == 0 {
+		return "", 0
+	}
+	return strings.Join(rendered, " "), used
+}
+
+func refBadgeStyle(ref string, selected bool) lipgloss.Style {
+	switch {
+	case strings.Contains(ref, "HEAD"):
+		if selected {
+			return styleSelectedRefHead
+		}
+		return styleRefHead
+	case strings.HasPrefix(ref, "tag:"):
+		if selected {
+			return styleSelectedRefTag
+		}
+		return styleRefTag
+	default:
+		if selected {
+			return styleSelectedRefBranch
+		}
+		return styleRefBranch
+	}
 }
