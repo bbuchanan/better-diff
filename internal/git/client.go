@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"better-diff/internal/conflicts"
 	"better-diff/internal/domain"
 )
 
@@ -463,6 +464,43 @@ func GetBlame(ctx context.Context, cwd, revision, path string) (map[int]domain.B
 	return blame, nil
 }
 
+func GetFileContent(ctx context.Context, cwd, revision, path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+
+	if revision == "" || revision == WorkingTreeRef {
+		targetPath, err := resolveWorktreePath(cwd, path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return "", nil
+			}
+			return "", err
+		}
+		content, err := os.ReadFile(targetPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return "", nil
+			}
+			return "", err
+		}
+		return sanitizeOutput(string(content)), nil
+	}
+
+	raw, err := runGit(ctx, cwd, "show", revision+":"+path)
+	if err != nil {
+		if commandErr, ok := err.(*CommandError); ok {
+			stderr := commandErr.Stderr
+			if strings.Contains(stderr, "does not exist in") || strings.Contains(stderr, "exists on disk, but not in") || strings.Contains(stderr, "path '"+path+"' does not exist") {
+				return "", nil
+			}
+		}
+		return "", err
+	}
+
+	return raw, nil
+}
+
 func ListConflictFiles(ctx context.Context, cwd string) ([]domain.ConflictFile, error) {
 	raw, err := runGit(ctx, cwd, "ls-files", "-u", "-z")
 	if err != nil {
@@ -573,6 +611,36 @@ func AcceptConflictSide(ctx context.Context, cwd, path, side string) error {
 
 	if _, err := runGit(ctx, cwd, "add", "--", path); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func ApplyConflictBlockResolution(ctx context.Context, cwd, path string, blockIndex int, resolution string) error {
+	if resolution != "ours" && resolution != "theirs" && resolution != "both" {
+		return fmt.Errorf("unsupported conflict block resolution: %s", resolution)
+	}
+
+	targetPath, err := resolveWorktreePath(cwd, path)
+	if err != nil {
+		return err
+	}
+
+	content, err := os.ReadFile(targetPath)
+	if err != nil {
+		return err
+	}
+
+	parsed := conflicts.Parse(string(content))
+	rendered, resolved := conflicts.RenderResolved(parsed, blockIndex, resolution)
+	if err := os.WriteFile(targetPath, []byte(rendered), 0o644); err != nil {
+		return err
+	}
+
+	if resolved {
+		if _, err := runGit(ctx, cwd, "add", "--", path); err != nil {
+			return err
+		}
 	}
 
 	return nil

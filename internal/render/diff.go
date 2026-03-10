@@ -29,10 +29,12 @@ type Document struct {
 }
 
 type RowMeta struct {
-	Kind         LineKind
-	OldLine      int
-	NewLine      int
-	Continuation bool
+	Kind          LineKind
+	OldLine       int
+	NewLine       int
+	Continuation  bool
+	Conflict      bool
+	ConflictIndex int
 }
 
 type File struct {

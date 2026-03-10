@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"better-diff/internal/conflicts"
 	"better-diff/internal/domain"
 	gitadapter "better-diff/internal/git"
 	"better-diff/internal/render"
@@ -26,6 +27,13 @@ type diffLayout string
 const (
 	diffLayoutInline diffLayout = "inline"
 	diffLayoutSplit  diffLayout = "split"
+)
+
+type diffViewMode string
+
+const (
+	diffViewPatch    diffViewMode = "patch"
+	diffViewFullFile diffViewMode = "full"
 )
 
 type repoLoadedMsg struct {
@@ -59,6 +67,12 @@ type diffLoadedMsg struct {
 	err      error
 }
 
+type fullFileLoadedMsg struct {
+	key     string
+	compare *render.FullFileCompare
+	err     error
+}
+
 type blameLoadedMsg struct {
 	key   string
 	lines map[int]domain.BlameLine
@@ -80,6 +94,15 @@ type renderedDiff struct {
 	rows     []string
 	rowMeta  []render.RowMeta
 	hunkRows []int
+}
+
+type fullFileSpec struct {
+	leftRevision  string
+	rightRevision string
+	leftLabel     string
+	rightLabel    string
+	leftPath      string
+	rightPath     string
 }
 
 type model struct {
@@ -111,6 +134,8 @@ type model struct {
 	paletteQuery       string
 	paletteSelected    int
 	diffLayout         diffLayout
+	diffViewMode       diffViewMode
+	diffFullScreen     bool
 	refPickerOpen      bool
 	refPickerQuery     string
 	refPickerStep      int
@@ -123,9 +148,11 @@ type model struct {
 	preferredFilePath  string
 	showBlame          bool
 	blameDetailOpen    bool
+	conflictBaseOpen   bool
 
 	diff             string
 	diffLoaded       bool
+	fullFileCompare  *render.FullFileCompare
 	conflictContents *domain.ConflictFileContents
 	loading          bool
 	loadingFiles     bool
@@ -137,6 +164,7 @@ type model struct {
 
 	fileCache     map[string][]domain.FileChange
 	diffCache     map[string]string
+	fullFileCache map[string]render.FullFileCompare
 	conflictCache map[string]domain.ConflictFileContents
 	renderCache   map[string]renderedDiff
 	blameCache    map[string]map[int]domain.BlameLine
@@ -152,9 +180,11 @@ func NewModel(cwd string) tea.Model {
 		presetDiffStyle:  domain.DiffThreeDot,
 		commitDiffStyle:  domain.DiffTwoDot,
 		diffLayout:       diffLayoutInline,
+		diffViewMode:     diffViewPatch,
 		showBlame:        true,
 		fileCache:        map[string][]domain.FileChange{},
 		diffCache:        map[string]string{},
+		fullFileCache:    map[string]render.FullFileCompare{},
 		conflictCache:    map[string]domain.ConflictFileContents{},
 		renderCache:      map[string]renderedDiff{},
 		blameCache:       map[string]map[int]domain.BlameLine{},
@@ -293,6 +323,34 @@ func loadRangeDiffCmdWithOptions(root string, compare domain.CompareSelection, p
 	}
 }
 
+func loadFullFileCompareCmd(root, key, leftRevision, rightRevision, leftLabel, rightLabel, leftPath, rightPath string, ignoreWhitespace bool) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := gitadapter.Context(8 * time.Second)
+		defer cancel()
+
+		leftText, err := gitadapter.GetFileContent(ctx, root, leftRevision, leftPath)
+		if err != nil {
+			return fullFileLoadedMsg{key: key, err: err}
+		}
+
+		rightText, err := gitadapter.GetFileContent(ctx, root, rightRevision, rightPath)
+		if err != nil {
+			return fullFileLoadedMsg{key: key, err: err}
+		}
+
+		compare := render.FullFileCompare{
+			LeftLabel:        leftLabel,
+			RightLabel:       rightLabel,
+			LeftPath:         leftPath,
+			RightPath:        rightPath,
+			LeftText:         leftText,
+			RightText:        rightText,
+			IgnoreWhitespace: ignoreWhitespace,
+		}
+		return fullFileLoadedMsg{key: key, compare: &compare}
+	}
+}
+
 func prefetchCommitDiffCmd(root, sha, path string, contextLines int) tea.Cmd {
 	return prefetchCommitDiffCmdWithOptions(root, sha, path, contextLines, false)
 }
@@ -377,6 +435,20 @@ func acceptConflictCmd(root, path, side string) tea.Cmd {
 	}
 }
 
+func applyConflictBlockCmd(root, path string, blockIndex int, resolution string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := gitadapter.Context(5 * time.Second)
+		defer cancel()
+
+		err := gitadapter.ApplyConflictBlockResolution(ctx, root, path, blockIndex, resolution)
+		if err != nil {
+			return actionDoneMsg{err: err}
+		}
+
+		return actionDoneMsg{message: fmt.Sprintf("Applied %s to conflict %d in %s.", resolution, blockIndex+1, path)}
+	}
+}
+
 func (m *model) selectedCommitValue() *domain.CommitSummary {
 	if m.selectedCommit < 0 || m.selectedCommit >= len(m.commits) {
 		return nil
@@ -404,6 +476,74 @@ func (m *model) selectedConflictValue() *domain.ConflictFile {
 		}
 	}
 
+	return nil
+}
+
+func (m *model) currentFullFileSpec() *fullFileSpec {
+	file := m.selectedFileValue()
+	if m.repo == nil || file == nil {
+		return nil
+	}
+
+	leftPath := file.Path
+	if file.OldPath != "" {
+		leftPath = file.OldPath
+	}
+
+	if compare := m.activeComparison(); compare != nil {
+		return &fullFileSpec{
+			leftRevision:  compare.LeftRef,
+			rightRevision: compare.RightRef,
+			leftLabel:     compare.LeftLabel,
+			rightLabel:    compare.RightLabel,
+			leftPath:      leftPath,
+			rightPath:     file.Path,
+		}
+	}
+
+	commit := m.selectedCommitValue()
+	if commit == nil {
+		return nil
+	}
+
+	return &fullFileSpec{
+		leftRevision:  commit.SHA + "^",
+		rightRevision: commit.SHA,
+		leftLabel:     commit.ShortSHA + "^",
+		rightLabel:    commit.ShortSHA,
+		leftPath:      leftPath,
+		rightPath:     file.Path,
+	}
+}
+
+func (m *model) currentConflictBlockIndex(width int) int {
+	if m.mode != domain.ModeConflict {
+		return -1
+	}
+	meta := m.currentDiffRowMeta(width)
+	if meta == nil || !meta.Conflict {
+		return -1
+	}
+	return meta.ConflictIndex
+}
+
+func (m *model) currentConflictBlock(width int) *conflicts.Block {
+	if m.mode != domain.ModeConflict || m.conflictContents == nil {
+		return nil
+	}
+
+	blockIndex := m.currentConflictBlockIndex(width)
+	if blockIndex < 0 {
+		return nil
+	}
+
+	parsed := conflicts.Parse(m.conflictContents.Merged)
+	for _, segment := range parsed.Segments {
+		if segment.Block != nil && segment.Block.Index == blockIndex {
+			block := *segment.Block
+			return &block
+		}
+	}
 	return nil
 }
 
@@ -844,6 +984,22 @@ func (m *model) currentEditorLine(width int) int {
 }
 
 func (m *model) currentDiffStatus(width int) string {
+	if m.mode == domain.ModeConflict {
+		meta := m.currentDiffRowMeta(width)
+		if meta == nil {
+			return ""
+		}
+		parts := []string{"merge view"}
+		if meta.Conflict {
+			parts = append(parts, fmt.Sprintf("conflict %d", meta.ConflictIndex+1))
+		}
+		parts = append(parts, "old "+formatLineNumber(meta.OldLine), "new "+formatLineNumber(meta.NewLine))
+		status := strings.Join(parts, "  |  ")
+		if width > 0 {
+			status = trimToWidth(status, width)
+		}
+		return status
+	}
 	if !m.diffLoaded {
 		return ""
 	}
@@ -1042,8 +1198,20 @@ func (m *model) currentDiffCacheKey() string {
 	return fmt.Sprintf("commit:%s:%s:%d%s", commit.SHA, path, m.contextLines, ws)
 }
 
+func (m *model) currentFullFileCacheKey() string {
+	key := m.currentDiffCacheKey()
+	if key == "" {
+		return ""
+	}
+	return key + ":full"
+}
+
 func (m *model) currentRenderCacheKey(width int) string {
-	return fmt.Sprintf("%s:%s:%d", m.currentDiffCacheKey(), m.diffLayout, width)
+	baseKey := m.currentDiffCacheKey()
+	if m.diffViewMode == diffViewFullFile {
+		baseKey = m.currentFullFileCacheKey()
+	}
+	return fmt.Sprintf("%s:%s:%s:%d", baseKey, m.diffViewMode, m.diffLayout, width)
 }
 
 func (m *model) renderDocument(width int) renderedDiff {
@@ -1053,7 +1221,12 @@ func (m *model) renderDocument(width int) renderedDiff {
 	}
 
 	document := render.BuildInlineDocument(m.diff, width)
-	if m.diffLayout == diffLayoutSplit {
+	switch {
+	case m.mode == domain.ModeConflict && m.conflictContents != nil:
+		document = render.BuildConflictDocument(m.conflictContents.Path, m.conflictContents.Merged, width)
+	case m.diffViewMode == diffViewFullFile && m.fullFileCompare != nil:
+		document = render.BuildFullFileDocument(*m.fullFileCompare, width)
+	case m.diffLayout == diffLayoutSplit:
 		document = render.BuildSideBySideDocument(m.diff, width)
 	}
 
@@ -1081,6 +1254,9 @@ func (m *model) currentDiffViewportHeight() int {
 	}
 	if m.blameDetailOpen {
 		contentHeight -= 7
+	}
+	if m.conflictBaseOpen {
+		contentHeight -= 9
 	}
 	if m.refPickerOpen {
 		contentHeight -= 12
@@ -1121,7 +1297,14 @@ func (m *model) moveDiffCursor(delta int, width int) {
 }
 
 func (m *model) jumpToHunk(direction int, width int) {
-	if m.diff == "" || width <= 0 {
+	if width <= 0 {
+		return
+	}
+	if m.diffViewMode == diffViewFullFile {
+		if m.fullFileCompare == nil {
+			return
+		}
+	} else if m.diff == "" {
 		return
 	}
 
@@ -1152,6 +1335,13 @@ func (m *model) jumpToHunk(direction int, width int) {
 	}
 	m.diffCursor = document.hunkRows[0]
 	m.syncDiffCursor(width)
+}
+
+func (m *model) toggleDiffFullScreen() {
+	m.diffFullScreen = !m.diffFullScreen
+	if m.diffFullScreen {
+		m.focus = focusDiff
+	}
 }
 
 func (m *model) currentSelectionLabel() string {
@@ -1192,6 +1382,7 @@ func (m *model) refreshFiles() tea.Cmd {
 	m.conflictContents = nil
 	m.diffScroll = 0
 	m.diffCursor = 0
+	m.conflictBaseOpen = false
 	m.selectedFile = 0
 
 	if m.mode == domain.ModeConflict {
@@ -1246,11 +1437,14 @@ func (m *model) refreshDiff() tea.Cmd {
 	m.diffErr = ""
 	m.diff = ""
 	m.diffLoaded = false
+	m.fullFileCompare = nil
 	m.conflictContents = nil
 	m.diffScroll = 0
 	m.diffCursor = 0
+	m.conflictBaseOpen = false
 
 	cacheKey := m.currentDiffCacheKey()
+	fullCacheKey := m.currentFullFileCacheKey()
 	if cacheKey != "" {
 		if m.mode == domain.ModeConflict {
 			if cached, ok := m.conflictCache[cacheKey]; ok {
@@ -1258,6 +1452,14 @@ func (m *model) refreshDiff() tea.Cmd {
 				copy := cached
 				m.conflictContents = &copy
 				return nil
+			}
+		} else if m.diffViewMode == diffViewFullFile {
+			if cached, ok := m.fullFileCache[fullCacheKey]; ok {
+				m.loadingDiff = false
+				copy := cached
+				m.fullFileCompare = &copy
+				m.diffLoaded = true
+				return m.maybeLoadBlame()
 			}
 		} else if cached, ok := m.diffCache[cacheKey]; ok {
 			m.loadingDiff = false
@@ -1280,6 +1482,28 @@ func (m *model) refreshDiff() tea.Cmd {
 	path := ""
 	if file != nil {
 		path = file.Path
+	}
+
+	if m.diffViewMode == diffViewFullFile {
+		spec := m.currentFullFileSpec()
+		if spec == nil {
+			m.loadingDiff = false
+			return nil
+		}
+		return tea.Batch(
+			loadFullFileCompareCmd(
+				m.repo.RootPath,
+				fullCacheKey,
+				spec.leftRevision,
+				spec.rightRevision,
+				spec.leftLabel,
+				spec.rightLabel,
+				spec.leftPath,
+				spec.rightPath,
+				m.ignoreWhitespace,
+			),
+			m.maybeLoadBlame(),
+		)
 	}
 
 	if compare := m.activeComparison(); compare != nil {
@@ -1319,7 +1543,7 @@ func (m *model) prefetchNeighborFiles() tea.Cmd {
 }
 
 func (m *model) prefetchNeighborDiffs() tea.Cmd {
-	if m.repo == nil || m.mode == domain.ModeConflict || len(m.files) == 0 {
+	if m.repo == nil || m.mode == domain.ModeConflict || len(m.files) == 0 || m.diffViewMode == diffViewFullFile {
 		return nil
 	}
 
@@ -1367,6 +1591,7 @@ func (m *model) hardRefresh() tea.Cmd {
 	m.loading = true
 	m.fileCache = map[string][]domain.FileChange{}
 	m.diffCache = map[string]string{}
+	m.fullFileCache = map[string]render.FullFileCompare{}
 	m.conflictCache = map[string]domain.ConflictFileContents{}
 	m.renderCache = map[string]renderedDiff{}
 	m.blameCache = map[string]map[int]domain.BlameLine{}
@@ -1408,6 +1633,21 @@ func (m *model) toggleDiffLayout() {
 	m.diffLayout = diffLayoutInline
 }
 
+func (m *model) toggleDiffViewMode() {
+	if m.diffViewMode == diffViewPatch {
+		m.diffViewMode = diffViewFullFile
+		return
+	}
+	m.diffViewMode = diffViewPatch
+}
+
+func (m *model) diffViewLabel() string {
+	if m.diffViewMode == diffViewFullFile {
+		return "full-file"
+	}
+	return string(m.diffLayout)
+}
+
 func (m *model) filteredPaletteCommands() []paletteCommand {
 	commands := []paletteCommand{
 		{id: "refresh", label: "Refresh repo", description: "Reload commits, files, conflicts, and caches"},
@@ -1417,6 +1657,8 @@ func (m *model) filteredPaletteCommands() []paletteCommand {
 		{id: "compare-refs", label: "Compare arbitrary refs", description: "Choose any two branches, tags, or refs to compare"},
 		{id: "toggle-whitespace", label: "Toggle ignore whitespace", description: "Hide or show whitespace-only diff noise"},
 		{id: "toggle-layout", label: "Toggle diff layout", description: "Switch between inline and side-by-side diff rendering"},
+		{id: "toggle-view-mode", label: "Toggle patch/full-file", description: "Switch between patch review and full-file compare"},
+		{id: "toggle-fullscreen", label: "Toggle diff fullscreen", description: "Show only the diff pane and keep the header visible"},
 		{id: "context-up", label: "Increase context", description: "Show more unchanged lines around each hunk"},
 		{id: "context-down", label: "Decrease context", description: "Show fewer unchanged lines around each hunk"},
 	}
@@ -1499,6 +1741,12 @@ func (m *model) executePaletteCommand(command paletteCommand) tea.Cmd {
 		return nil
 	case "toggle-layout":
 		m.toggleDiffLayout()
+		return nil
+	case "toggle-view-mode":
+		m.toggleDiffViewMode()
+		return m.refreshDiff()
+	case "toggle-fullscreen":
+		m.toggleDiffFullScreen()
 		return nil
 	case "context-down":
 		if m.contextLines > 0 {
@@ -1631,6 +1879,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.blameCache[msg.key] = msg.lines
 		}
 		return m, nil
+	case fullFileLoadedMsg:
+		m.loadingDiff = false
+		if msg.err != nil {
+			m.diffErr = msg.err.Error()
+			return m, nil
+		}
+		if msg.compare == nil {
+			return m, nil
+		}
+		m.fullFileCache[msg.key] = *msg.compare
+		if msg.key == m.currentFullFileCacheKey() {
+			copy := *msg.compare
+			m.fullFileCompare = &copy
+			m.diffLoaded = true
+		}
+		return m, nil
 	case diffLoadedMsg:
 		m.loadingDiff = false
 		if msg.err != nil {
@@ -1663,6 +1927,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if m.blameDetailOpen && msg.String() == "esc" {
 			m.blameDetailOpen = false
+			return m, nil
+		}
+		if m.conflictBaseOpen && msg.String() == "esc" {
+			m.conflictBaseOpen = false
 			return m, nil
 		}
 
@@ -1815,6 +2083,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.actionMessage = "Inline blame off."
 			return m, nil
 		case "K":
+			if m.mode == domain.ModeConflict {
+				m.conflictBaseOpen = !m.conflictBaseOpen
+				return m, nil
+			}
 			if !m.showBlame {
 				m.showBlame = true
 				m.blameDetailOpen = true
@@ -1891,7 +2163,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "i":
+			if m.diffViewMode == diffViewFullFile {
+				m.actionMessage = "Full-file view is always side-by-side."
+				return m, nil
+			}
 			m.toggleDiffLayout()
+			return m, nil
+		case "f":
+			if m.mode == domain.ModeConflict {
+				return m, nil
+			}
+			m.toggleDiffViewMode()
+			return m, m.refreshDiff()
+		case "F":
+			m.toggleDiffFullScreen()
 			return m, nil
 		case "g":
 			if m.mode != domain.ModeConflict {
@@ -1924,7 +2209,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.mode == domain.ModeConflict && m.repo != nil {
 				conflict := m.selectedConflictValue()
 				if conflict != nil {
-					m.actionMessage = "Applying ours..."
+					if blockIndex := m.currentConflictBlockIndex(m.currentDiffContentWidth()); blockIndex >= 0 {
+						m.actionMessage = fmt.Sprintf("Applying ours to conflict %d...", blockIndex+1)
+						return m, applyConflictBlockCmd(m.repo.RootPath, conflict.Path, blockIndex, "ours")
+					}
+					m.actionMessage = "Applying whole file ours..."
 					return m, acceptConflictCmd(m.repo.RootPath, conflict.Path, "ours")
 				}
 			}
@@ -1933,7 +2222,40 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.mode == domain.ModeConflict && m.repo != nil {
 				conflict := m.selectedConflictValue()
 				if conflict != nil {
-					m.actionMessage = "Applying theirs..."
+					if blockIndex := m.currentConflictBlockIndex(m.currentDiffContentWidth()); blockIndex >= 0 {
+						m.actionMessage = fmt.Sprintf("Applying theirs to conflict %d...", blockIndex+1)
+						return m, applyConflictBlockCmd(m.repo.RootPath, conflict.Path, blockIndex, "theirs")
+					}
+					m.actionMessage = "Applying whole file theirs..."
+					return m, acceptConflictCmd(m.repo.RootPath, conflict.Path, "theirs")
+				}
+			}
+			return m, nil
+		case "3":
+			if m.mode == domain.ModeConflict && m.repo != nil {
+				conflict := m.selectedConflictValue()
+				if conflict != nil {
+					if blockIndex := m.currentConflictBlockIndex(m.currentDiffContentWidth()); blockIndex >= 0 {
+						m.actionMessage = fmt.Sprintf("Applying both sides to conflict %d...", blockIndex+1)
+						return m, applyConflictBlockCmd(m.repo.RootPath, conflict.Path, blockIndex, "both")
+					}
+				}
+			}
+			return m, nil
+		case "O":
+			if m.mode == domain.ModeConflict && m.repo != nil {
+				conflict := m.selectedConflictValue()
+				if conflict != nil {
+					m.actionMessage = "Applying whole file ours..."
+					return m, acceptConflictCmd(m.repo.RootPath, conflict.Path, "ours")
+				}
+			}
+			return m, nil
+		case "T":
+			if m.mode == domain.ModeConflict && m.repo != nil {
+				conflict := m.selectedConflictValue()
+				if conflict != nil {
+					m.actionMessage = "Applying whole file theirs..."
 					return m, acceptConflictCmd(m.repo.RootPath, conflict.Path, "theirs")
 				}
 			}
@@ -1998,6 +2320,12 @@ func (m *model) View() string {
 		contentHeight -= panelHeight
 		blameDetail = m.renderBlameDetail(m.width-2, panelHeight)
 	}
+	conflictBaseDetail := ""
+	if m.conflictBaseOpen {
+		panelHeight := 9
+		contentHeight -= panelHeight
+		conflictBaseDetail = m.renderConflictBaseDetail(m.width-2, panelHeight)
+	}
 	refPicker := ""
 	if m.refPickerOpen {
 		pickerHeight := 12
@@ -2008,19 +2336,24 @@ func (m *model) View() string {
 		contentHeight = 12
 	}
 
-	leftWidth := clampInt(m.width/3, 28, 42)
-	midWidth := clampInt(m.width/4, 24, 34)
-	rightWidth := m.width - leftWidth - midWidth - 6
-	if rightWidth < 40 {
-		rightWidth = 40
-	}
+	panes := ""
+	if m.diffFullScreen {
+		panes = m.renderDiffPane(maxInt(40, m.width-2), contentHeight)
+	} else {
+		leftWidth := clampInt(m.width/3, 28, 42)
+		midWidth := clampInt(m.width/4, 24, 34)
+		rightWidth := m.width - leftWidth - midWidth - 6
+		if rightWidth < 40 {
+			rightWidth = 40
+		}
 
-	panes := lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		m.renderCommitsPane(leftWidth, contentHeight),
-		m.renderFilesPane(midWidth, contentHeight),
-		m.renderDiffPane(rightWidth, contentHeight),
-	)
+		panes = lipgloss.JoinHorizontal(
+			lipgloss.Top,
+			m.renderCommitsPane(leftWidth, contentHeight),
+			m.renderFilesPane(midWidth, contentHeight),
+			m.renderDiffPane(rightWidth, contentHeight),
+		)
+	}
 
 	parts := append([]string{}, header...)
 	if palette != "" {
@@ -2031,6 +2364,9 @@ func (m *model) View() string {
 	}
 	if blameDetail != "" {
 		parts = append(parts, blameDetail)
+	}
+	if conflictBaseDetail != "" {
+		parts = append(parts, conflictBaseDetail)
 	}
 	if refPicker != "" {
 		parts = append(parts, refPicker)
@@ -2047,6 +2383,9 @@ func (m *model) currentRepoLabel() string {
 }
 
 func (m *model) currentDiffContentWidth() int {
+	if m.diffFullScreen {
+		return m.diffRenderWidth(maxInt(8, m.width-6))
+	}
 	leftWidth := clampInt(m.width/3, 28, 42)
 	midWidth := clampInt(m.width/4, 24, 34)
 	rightWidth := m.width - leftWidth - midWidth - 6
@@ -2066,9 +2405,9 @@ func (m *model) diffRenderWidth(totalWidth int) int {
 
 func (m *model) keyHelp() string {
 	if m.mode == domain.ModeConflict {
-		return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, w whitespace, B blame, K blame detail, : palette, b refs, i layout (%s), [ ] hunks, o editor line, 1 ours, 2 theirs, r refresh, q quit", m.diffLayout)
+		return "Keys: tab/h/l switch panes, j/k move in focused pane, : palette, F fullscreen, [ ] conflicts, K base detail, 1 ours block, 2 theirs block, 3 both block, O whole ours, T whole theirs, o editor line, r refresh, q quit"
 	}
-	return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, enter file compare, w whitespace, B blame, K blame detail, : palette, b refs, i layout (%s), [ ] hunks, c compare, v anchor compare, g history, +/- context %d, o editor line, r refresh, q quit", m.diffLayout, m.contextLines)
+	return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, enter file compare, w whitespace, B blame, K blame detail, : palette, b refs, i layout (%s), f view (%s), F fullscreen, [ ] hunks, c compare, v anchor compare, g history, +/- context %d, o editor line, r refresh, q quit", m.diffLayout, m.diffViewMode, m.contextLines)
 }
 
 func (m *model) renderCommitsPane(width, height int) string {
@@ -2204,6 +2543,42 @@ func (m *model) renderBlameDetail(width, height int) string {
 		Render(strings.Join(lines, "\n"))
 }
 
+func (m *model) renderConflictBaseDetail(width, height int) string {
+	block := m.currentConflictBlock(m.currentDiffContentWidth())
+	lines := []string{
+		styleAccent.Render("Conflict Base"),
+	}
+
+	switch {
+	case block == nil:
+		lines = append(lines, styleMuted.Render("No conflict block is selected right now. Move the diff cursor onto a conflict block and press K again."))
+	case len(block.Base) == 0:
+		lines = append(lines,
+			styleMuted.Render(fmt.Sprintf("Conflict %d has no base section in the merge markers.", block.Index+1)),
+			styleMuted.Render("Esc closes."),
+		)
+	default:
+		lines = append(lines, styleMuted.Render(fmt.Sprintf("Conflict %d  |  base lines: %d", block.Index+1, len(block.Base))))
+		available := maxInt(1, height-5)
+		visible := minInt(len(block.Base), available)
+		for index := 0; index < visible; index++ {
+			lines = append(lines, styleMuted.Render(trimToWidth(block.Base[index], width-4)))
+		}
+		if remaining := len(block.Base) - visible; remaining > 0 {
+			lines = append(lines, styleMuted.Render(fmt.Sprintf("... %d more line(s)", remaining)))
+		}
+		lines = append(lines, styleMuted.Render("Esc closes."))
+	}
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color("8")).
+		Width(width).
+		Height(height).
+		Padding(0, 1).
+		Render(strings.Join(lines, "\n"))
+}
+
 func (m *model) renderRefPicker(width, height int) string {
 	title := "Compare Refs"
 	step := "Pick left ref"
@@ -2293,9 +2668,16 @@ func (m *model) renderFilesPane(width, height int) string {
 
 func (m *model) renderDiffPane(width, height int) string {
 	lines := []string{}
-	title := "Diff [" + string(m.diffLayout) + "]"
+	viewLabel := m.diffViewLabel()
+	if m.mode == domain.ModeConflict {
+		viewLabel = "conflict"
+	}
+	title := "Diff [" + viewLabel + "]"
 	if m.focus == focusDiff {
 		title += " [j/k selects line]"
+	}
+	if m.diffFullScreen {
+		title += " [fullscreen]"
 	}
 	if m.loadingDiff {
 		lines = append(lines, styleAccent.Render("Loading diff..."))
@@ -2304,18 +2686,14 @@ func (m *model) renderDiffPane(width, height int) string {
 		lines = append(lines, styleMuted.Render(m.diffErr))
 	}
 
-	if m.mode == domain.ModeConflict {
-		lines = append(lines, m.renderConflictContents(width-4)...)
-	} else {
-		status := m.currentDiffStatus(width - 4)
-		if status != "" {
-			lines = append(lines, styleCursorInfo.Width(width-4).Render(status))
-		}
-		lines = append(lines, m.renderDiffLines(width-4, maxInt(1, height-3-len(lines)))...)
+	status := m.currentDiffStatus(width - 4)
+	if status != "" {
+		lines = append(lines, styleCursorInfo.Width(width-4).Render(status))
 	}
+	lines = append(lines, m.renderDiffLines(width-4, maxInt(1, height-3-len(lines)))...)
 
 	if file := m.selectedFileValue(); file != nil {
-		title = "Diff [" + string(m.diffLayout) + "]: " + trimToWidth(file.Path, width-20)
+		title = "Diff [" + viewLabel + "]: " + trimToWidth(file.Path, width-20)
 	}
 
 	return paneStyle(width, height, m.focus == focusDiff).Render(title + "\n\n" + strings.Join(lines, "\n"))
@@ -2380,7 +2758,15 @@ func (m *model) renderCommitLine(commit domain.CommitSummary, selected bool, wid
 }
 
 func (m *model) renderDiffLines(width, height int) []string {
-	if m.diff == "" {
+	if m.mode == domain.ModeConflict {
+		if m.conflictContents == nil {
+			return []string{styleMuted.Render("No conflict content loaded.")}
+		}
+	} else if m.diffViewMode == diffViewFullFile {
+		if m.fullFileCompare == nil {
+			return []string{styleMuted.Render(m.emptyDiffMessage())}
+		}
+	} else if m.diff == "" {
 		return []string{styleMuted.Render(m.emptyDiffMessage())}
 	}
 

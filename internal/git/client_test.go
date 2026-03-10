@@ -264,3 +264,34 @@ func TestWorkingTreeRangeDiff(t *testing.T) {
 		t.Fatalf("expected working tree diff to contain uncommitted line, got %q", diff)
 	}
 }
+
+func TestApplyConflictBlockResolution(t *testing.T) {
+	repo := t.TempDir()
+	runTestGit(t, repo, "init")
+	runTestGit(t, repo, "config", "user.name", "Test User")
+	runTestGit(t, repo, "config", "user.email", "test@example.com")
+	conflictPath := filepath.Join(repo, "demo.txt")
+	content := "<<<<<<< ours\nalpha\n=======\nbeta\n>>>>>>> theirs\n"
+	if err := os.WriteFile(conflictPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	ctx, cancel := Context(5 * time.Second)
+	defer cancel()
+
+	if err := ApplyConflictBlockResolution(ctx, repo, "demo.txt", 0, "both"); err != nil {
+		t.Fatalf("ApplyConflictBlockResolution returned error: %v", err)
+	}
+
+	updated, err := os.ReadFile(conflictPath)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	got := string(updated)
+	if strings.Contains(got, "<<<<<<<") || strings.Contains(got, ">>>>>>>") {
+		t.Fatalf("expected conflict markers to be removed, got %q", got)
+	}
+	if !strings.Contains(got, "alpha\nbeta\n") {
+		t.Fatalf("expected both sides to remain, got %q", got)
+	}
+}

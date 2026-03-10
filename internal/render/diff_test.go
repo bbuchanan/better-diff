@@ -41,6 +41,28 @@ index 1111111..2222222 100644
  }
 `
 
+const fullFileLeft = `package main
+
+func alpha() string {
+	return "alpha"
+}
+
+func gamma() string {
+	return "gamma"
+}
+`
+
+const fullFileRight = `package main
+
+func alpha() int {
+	return 1
+}
+
+func beta() string {
+	return "beta"
+}
+`
+
 func TestParseUnifiedDiff(t *testing.T) {
 	parsed := ParseUnifiedDiff(sampleDiff)
 	if len(parsed.Files) != 1 {
@@ -125,6 +147,65 @@ func TestBuildDocumentsTrackHunkRows(t *testing.T) {
 	}
 	if split.HunkRows[1] <= split.HunkRows[0] {
 		t.Fatalf("expected split hunk rows to increase, got %+v", split.HunkRows)
+	}
+}
+
+func TestBuildFullFileDocument(t *testing.T) {
+	document := BuildFullFileDocument(FullFileCompare{
+		LeftLabel:  "HEAD",
+		RightLabel: "Working Tree",
+		LeftPath:   "demo.go",
+		RightPath:  "demo.go",
+		LeftText:   fullFileLeft,
+		RightText:  fullFileRight,
+	}, 120)
+
+	rendered := strings.Join(document.Rows, "\n")
+	if !strings.Contains(rendered, "[full-file]") {
+		t.Fatalf("expected full-file header, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "func gamma() string") {
+		t.Fatalf("expected left-side full-file content, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "func beta() string") {
+		t.Fatalf("expected right-side full-file content, got %q", rendered)
+	}
+	if len(document.HunkRows) == 0 {
+		t.Fatalf("expected full-file document to track change blocks")
+	}
+	if len(document.RowMeta) != len(document.Rows) {
+		t.Fatalf("row meta length = %d, want %d", len(document.RowMeta), len(document.Rows))
+	}
+}
+
+func TestBuildConflictDocument(t *testing.T) {
+	document := BuildConflictDocument("demo.go", `package main
+
+<<<<<<< ours
+func alpha() string {
+	return "ours"
+=======
+func alpha() int {
+	return 1
+>>>>>>> theirs
+`, 120)
+
+	rendered := strings.Join(document.Rows, "\n")
+	if !strings.Contains(rendered, "[conflict]") {
+		t.Fatalf("expected conflict header, got %q", rendered)
+	}
+	if len(document.HunkRows) != 1 {
+		t.Fatalf("expected 1 conflict block row marker, got %d", len(document.HunkRows))
+	}
+	foundConflict := false
+	for _, meta := range document.RowMeta {
+		if meta.Conflict {
+			foundConflict = true
+			break
+		}
+	}
+	if !foundConflict {
+		t.Fatal("expected conflict row metadata")
 	}
 }
 
