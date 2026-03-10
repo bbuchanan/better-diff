@@ -88,26 +88,30 @@ type model struct {
 	files         []domain.FileChange
 	conflictFiles []domain.ConflictFile
 
-	mode            domain.ExplorerMode
-	focus           paneFocus
-	selectedCommit  int
-	selectedFile    int
-	diffScroll      int
-	contextLines    int
-	presetDiffStyle domain.DiffStyle
-	commitDiffStyle domain.DiffStyle
-	compareAnchor   string
-	customCompare   *domain.CompareSelection
-	paletteOpen     bool
-	paletteQuery    string
-	paletteSelected int
-	diffLayout      diffLayout
-	refPickerOpen   bool
-	refPickerQuery  string
-	refPickerStep   int
-	refPickerLeft   *domain.RefSummary
-	refPickerRight  *domain.RefSummary
-	refPickerSelect int
+	mode               domain.ExplorerMode
+	focus              paneFocus
+	selectedCommit     int
+	selectedFile       int
+	diffScroll         int
+	contextLines       int
+	presetDiffStyle    domain.DiffStyle
+	commitDiffStyle    domain.DiffStyle
+	compareAnchor      string
+	customCompare      *domain.CompareSelection
+	paletteOpen        bool
+	paletteQuery       string
+	paletteSelected    int
+	diffLayout         diffLayout
+	refPickerOpen      bool
+	refPickerQuery     string
+	refPickerStep      int
+	refPickerLeft      *domain.RefSummary
+	refPickerRight     *domain.RefSummary
+	refPickerSelect    int
+	commitPickerOpen   bool
+	commitPickerQuery  string
+	commitPickerSelect int
+	preferredFilePath  string
 
 	diff             string
 	conflictContents *domain.ConflictFileContents
@@ -462,6 +466,85 @@ func (m *model) applySelectedRefPickerRef() tea.Cmd {
 	return m.refreshFiles()
 }
 
+func (m *model) filteredCommitPickerCommits() []domain.CommitSummary {
+	query := strings.ToLower(strings.TrimSpace(m.commitPickerQuery))
+	if m.selectedCommit < 0 || m.selectedCommit >= len(m.commits) {
+		return nil
+	}
+
+	filtered := make([]domain.CommitSummary, 0, len(m.commits))
+
+	for _, commit := range m.commits[m.selectedCommit+1:] {
+		if query != "" {
+			haystack := strings.ToLower(commit.ShortSHA + " " + commit.AuthorName + " " + commit.Subject + " " + strings.Join(commit.Refs, " "))
+			if !strings.Contains(haystack, query) {
+				continue
+			}
+		}
+		filtered = append(filtered, commit)
+	}
+
+	return filtered
+}
+
+func (m *model) selectedCommitPickerValue() *domain.CommitSummary {
+	commits := m.filteredCommitPickerCommits()
+	if m.commitPickerSelect < 0 || m.commitPickerSelect >= len(commits) {
+		return nil
+	}
+	commit := commits[m.commitPickerSelect]
+	return &commit
+}
+
+func (m *model) openCommitPicker() {
+	if m.mode == domain.ModeConflict || m.selectedFileValue() == nil || m.selectedCommitValue() == nil {
+		return
+	}
+
+	m.commitPickerOpen = true
+	m.commitPickerQuery = ""
+	m.commitPickerSelect = 0
+	m.paletteOpen = false
+	m.refPickerOpen = false
+}
+
+func (m *model) closeCommitPicker() {
+	m.commitPickerOpen = false
+	m.commitPickerQuery = ""
+	m.commitPickerSelect = 0
+}
+
+func (m *model) applySelectedCommitPicker() tea.Cmd {
+	selected := m.selectedCommitPickerValue()
+	file := m.selectedFileValue()
+	current := m.selectedCommitValue()
+	if selected == nil || file == nil || current == nil {
+		return nil
+	}
+
+	m.commitPickerOpen = false
+	m.commitPickerQuery = ""
+	m.commitPickerSelect = 0
+	m.compareAnchor = selected.SHA
+	m.customCompare = nil
+	m.mode = domain.ModeCompareCommits
+	m.preferredFilePath = file.Path
+	m.actionMessage = fmt.Sprintf("Comparing %s between %s and %s", file.Path, selected.ShortSHA, current.ShortSHA)
+	return m.refreshFiles()
+}
+
+func selectFileIndexByPath(files []domain.FileChange, path string) int {
+	if path == "" {
+		return 0
+	}
+	for index, file := range files {
+		if file.Path == path {
+			return index
+		}
+	}
+	return 0
+}
+
 func (m *model) commitBySHA(sha string) *domain.CommitSummary {
 	for _, commit := range m.commits {
 		if commit.SHA == sha {
@@ -620,6 +703,8 @@ func (m *model) refreshFiles() tea.Cmd {
 				m.filesErr = "No changed files for this selection."
 				return nil
 			}
+			m.selectedFile = selectFileIndexByPath(m.files, m.preferredFilePath)
+			m.preferredFilePath = ""
 			return tea.Batch(m.refreshDiff(), m.prefetchNeighborFiles(), m.prefetchNeighborDiffs())
 		}
 	}
@@ -820,6 +905,10 @@ func (m *model) filteredPaletteCommands() []paletteCommand {
 
 	if m.selectedFileValue() != nil {
 		commands = append(commands, paletteCommand{
+			id:          "compare-file-commit",
+			label:       "Compare selected file to commit",
+			description: "Pick another commit and keep the current file selected for the diff",
+		}, paletteCommand{
 			id:          "open-editor",
 			label:       "Open in editor",
 			description: "Open the selected file in $VISUAL, $EDITOR, or VS Code",
@@ -857,6 +946,9 @@ func (m *model) executePaletteCommand(command paletteCommand) tea.Cmd {
 		return nil
 	case "compare-refs":
 		m.openRefPicker()
+		return nil
+	case "compare-file-commit":
+		m.openCommitPicker()
 		return nil
 	case "context-up":
 		if m.contextLines < 20 {
@@ -980,7 +1072,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		m.selectedFile = 0
+		m.selectedFile = selectFileIndexByPath(m.files, m.preferredFilePath)
+		m.preferredFilePath = ""
 		return m, tea.Batch(m.refreshDiff(), m.prefetchNeighborDiffs())
 	case prefetchedFilesMsg:
 		if msg.key != "" && len(msg.files) >= 0 {
@@ -1021,6 +1114,41 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.actionMessage = msg.message
 		return m, m.hardRefresh()
 	case tea.KeyMsg:
+		if m.commitPickerOpen {
+			switch msg.String() {
+			case "esc":
+				m.closeCommitPicker()
+				return m, nil
+			case "enter":
+				return m, m.applySelectedCommitPicker()
+			case "backspace":
+				runes := []rune(m.commitPickerQuery)
+				if len(runes) > 0 {
+					m.commitPickerQuery = string(runes[:len(runes)-1])
+				}
+				m.commitPickerSelect = 0
+				return m, nil
+			case "up", "ctrl+p", "k":
+				commits := m.filteredCommitPickerCommits()
+				if len(commits) > 0 {
+					m.commitPickerSelect = clampInt(m.commitPickerSelect-1, 0, len(commits)-1)
+				}
+				return m, nil
+			case "down", "ctrl+n", "j":
+				commits := m.filteredCommitPickerCommits()
+				if len(commits) > 0 {
+					m.commitPickerSelect = clampInt(m.commitPickerSelect+1, 0, len(commits)-1)
+				}
+				return m, nil
+			default:
+				if len(msg.Runes) > 0 && !msg.Alt {
+					m.commitPickerQuery += string(msg.Runes)
+					m.commitPickerSelect = 0
+				}
+				return m, nil
+			}
+		}
+
 		if m.refPickerOpen {
 			switch msg.String() {
 			case "esc":
@@ -1116,6 +1244,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "b":
 			m.openRefPicker()
+			return m, nil
+		case "enter":
+			if m.focus == focusFiles {
+				m.openCommitPicker()
+				return m, nil
+			}
 			return m, nil
 		case "tab":
 			m.focus = paneFocus((int(m.focus) + 1) % 3)
@@ -1277,6 +1411,12 @@ func (m *model) View() string {
 		contentHeight -= paletteHeight
 		palette = m.renderPalette(m.width-2, paletteHeight)
 	}
+	commitPicker := ""
+	if m.commitPickerOpen {
+		pickerHeight := 12
+		contentHeight -= pickerHeight
+		commitPicker = m.renderCommitPicker(m.width-2, pickerHeight)
+	}
 	refPicker := ""
 	if m.refPickerOpen {
 		pickerHeight := 12
@@ -1304,6 +1444,9 @@ func (m *model) View() string {
 	parts := append([]string{}, header...)
 	if palette != "" {
 		parts = append(parts, palette)
+	}
+	if commitPicker != "" {
+		parts = append(parts, commitPicker)
 	}
 	if refPicker != "" {
 		parts = append(parts, refPicker)
@@ -1333,7 +1476,7 @@ func (m *model) keyHelp() string {
 	if m.mode == domain.ModeConflict {
 		return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, : palette, b refs, i layout (%s), [ ] hunks, 1 ours, 2 theirs, r refresh, q quit", m.diffLayout)
 	}
-	return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, selected file drives diff, : palette, b refs, i layout (%s), [ ] hunks, c compare, v anchor compare, g history, +/- context %d, o editor, r refresh, q quit", m.diffLayout, m.contextLines)
+	return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, enter file compare, : palette, b refs, i layout (%s), [ ] hunks, c compare, v anchor compare, g history, +/- context %d, o editor, r refresh, q quit", m.diffLayout, m.contextLines)
 }
 
 func (m *model) renderCommitsPane(width, height int) string {
@@ -1396,6 +1539,52 @@ func (m *model) renderPalette(width, height int) string {
 		Render(strings.Join(lines, "\n"))
 }
 
+func (m *model) renderCommitPicker(width, height int) string {
+	file := m.selectedFileValue()
+	current := m.selectedCommitValue()
+	target := "(no file selected)"
+	currentLabel := "(no commit selected)"
+	if file != nil {
+		target = file.Path
+	}
+	if current != nil {
+		currentLabel = current.ShortSHA + " " + current.Subject
+	}
+
+	lines := []string{
+		styleAccent.Render("Compare File To Commit"),
+		styleMuted.Render("Pick the other commit for the selected file. Type to filter. Enter selects. Esc closes."),
+		styleMuted.Render("File: " + trimToWidth(target, width-10)),
+		styleMuted.Render("Current: " + trimToWidth(currentLabel, width-13)),
+		styleMuted.Render("Query: " + m.commitPickerQuery),
+		"",
+	}
+
+	commits := m.filteredCommitPickerCommits()
+	if len(commits) == 0 {
+		lines = append(lines, styleMuted.Render("No matching commits."))
+	} else {
+		start, end := visibleListRange(len(commits), m.commitPickerSelect, height-len(lines)-2)
+		for i := start; i < end; i++ {
+			prefix := "  "
+			if i == m.commitPickerSelect {
+				prefix = "> "
+			}
+			commit := commits[i]
+			line := fmt.Sprintf("%s%s  %s", prefix, commit.ShortSHA, trimToWidth(commit.Subject, maxInt(8, width-18)))
+			lines = append(lines, trimToWidth(line, width-4))
+		}
+	}
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color("10")).
+		Width(width).
+		Height(height).
+		Padding(0, 1).
+		Render(strings.Join(lines, "\n"))
+}
+
 func (m *model) renderRefPicker(width, height int) string {
 	title := "Compare Refs"
 	step := "Pick left ref"
@@ -1448,7 +1637,7 @@ func (m *model) renderFilesPane(width, height int) string {
 	lines := []string{}
 	title := fmt.Sprintf("Files (%d)", len(m.files))
 	if m.focus == focusFiles {
-		title += " [j/k selects diff]"
+		title += " [enter compares file]"
 	}
 	if m.loadingFiles {
 		lines = append(lines, styleAccent.Render("Loading files..."))
