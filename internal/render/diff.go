@@ -22,6 +22,11 @@ type Diff struct {
 	Files []File
 }
 
+type Document struct {
+	Rows     []string
+	HunkRows []int
+}
+
 type File struct {
 	OldPath string
 	NewPath string
@@ -221,9 +226,13 @@ func ParseUnifiedDiff(diffText string) Diff {
 }
 
 func RenderInline(diffText string, width int) []string {
+	return BuildInlineDocument(diffText, width).Rows
+}
+
+func BuildInlineDocument(diffText string, width int) Document {
 	parsed := ParseUnifiedDiff(diffText)
 	if len(parsed.Files) == 0 {
-		return []string{styleFileMeta.Render("No diff loaded.")}
+		return Document{Rows: []string{styleFileMeta.Render("No diff loaded.")}}
 	}
 
 	if width < 24 {
@@ -231,6 +240,7 @@ func RenderInline(diffText string, width int) []string {
 	}
 
 	lines := make([]string, 0, 64)
+	hunkRows := []int{}
 	for fileIndex, file := range parsed.Files {
 		if fileIndex > 0 {
 			lines = append(lines, "")
@@ -240,6 +250,7 @@ func RenderInline(diffText string, width int) []string {
 		lines = append(lines, renderFileMetadata(file, width)...)
 
 		for _, hunk := range file.Hunks {
+			hunkRows = append(hunkRows, len(lines))
 			lines = append(lines, trimStyled(styleHunkHeader.Width(width).Render(trimPlain(" "+hunk.Header+" ", width)), width))
 			for _, plan := range buildRenderPlans(hunk, detectLanguage(file.NewPath, file.OldPath)) {
 				lines = append(lines, renderPlanLines(plan, width)...)
@@ -247,21 +258,26 @@ func RenderInline(diffText string, width int) []string {
 		}
 	}
 
-	return lines
+	return Document{Rows: lines, HunkRows: hunkRows}
 }
 
 func RenderSideBySide(diffText string, width int) []string {
+	return BuildSideBySideDocument(diffText, width).Rows
+}
+
+func BuildSideBySideDocument(diffText string, width int) Document {
 	parsed := ParseUnifiedDiff(diffText)
 	if len(parsed.Files) == 0 {
-		return []string{styleFileMeta.Render("No diff loaded.")}
+		return Document{Rows: []string{styleFileMeta.Render("No diff loaded.")}}
 	}
 
 	if width < 72 {
-		return RenderInline(diffText, width)
+		return BuildInlineDocument(diffText, width)
 	}
 
 	columnWidth := maxInt(28, (width-3)/2)
 	lines := make([]string, 0, 64)
+	hunkRows := []int{}
 	for fileIndex, file := range parsed.Files {
 		if fileIndex > 0 {
 			lines = append(lines, "")
@@ -275,6 +291,7 @@ func RenderSideBySide(diffText string, width int) []string {
 		lines = append(lines, joinColumns(leftLabel, rightLabel))
 
 		for _, hunk := range file.Hunks {
+			hunkRows = append(hunkRows, len(lines))
 			lines = append(lines, trimStyled(styleHunkHeader.Width(width).Render(trimPlain(" "+hunk.Header+" ", width)), width))
 			for _, row := range buildSideBySideRows(hunk, detectLanguage(file.NewPath, file.OldPath)) {
 				lines = append(lines, renderSideBySideRowLines(row, columnWidth)...)
@@ -282,7 +299,7 @@ func RenderSideBySide(diffText string, width int) []string {
 		}
 	}
 
-	return lines
+	return Document{Rows: lines, HunkRows: hunkRows}
 }
 
 func buildRenderPlans(hunk Hunk, language string) []renderPlan {

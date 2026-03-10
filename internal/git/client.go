@@ -183,6 +183,65 @@ func ListCommits(ctx context.Context, cwd string, limit int) ([]domain.CommitSum
 	return commits, nil
 }
 
+func ListRefs(ctx context.Context, cwd string) ([]domain.RefSummary, error) {
+	raw, err := runGit(
+		ctx,
+		cwd,
+		"for-each-ref",
+		"--sort=-committerdate",
+		fmt.Sprintf("--format=%%(refname:short)%c%%(refname)%c%%(objectname:short)%c%%(refname:lstrip=2)", fieldSeparator, fieldSeparator, fieldSeparator),
+		"refs/heads",
+		"refs/remotes",
+		"refs/tags",
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	refs := make([]domain.RefSummary, 0, len(lines))
+	seen := map[string]struct{}{}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, string(fieldSeparator))
+		if len(fields) < 4 {
+			continue
+		}
+
+		name := strings.TrimSpace(fields[0])
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+
+		fullName := strings.TrimSpace(fields[1])
+		refType := "other"
+		switch {
+		case strings.HasPrefix(fullName, "refs/heads/"):
+			refType = "branch"
+		case strings.HasPrefix(fullName, "refs/remotes/"):
+			refType = "remote"
+		case strings.HasPrefix(fullName, "refs/tags/"):
+			refType = "tag"
+		}
+
+		refs = append(refs, domain.RefSummary{
+			Name:     name,
+			FullName: fullName,
+			ShortSHA: strings.TrimSpace(fields[2]),
+			Type:     refType,
+		})
+	}
+
+	return refs, nil
+}
+
 func parseNameStatusOutput(raw string) []domain.FileChange {
 	lines := strings.Split(raw, "\n")
 	files := make([]domain.FileChange, 0, len(lines))

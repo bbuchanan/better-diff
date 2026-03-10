@@ -31,6 +31,7 @@ const (
 type repoLoadedMsg struct {
 	repo      domain.RepositoryInfo
 	commits   []domain.CommitSummary
+	refs      []domain.RefSummary
 	conflicts []domain.ConflictFile
 	err       error
 }
@@ -69,6 +70,11 @@ type paletteCommand struct {
 	description string
 }
 
+type renderedDiff struct {
+	rows     []string
+	hunkRows []int
+}
+
 type model struct {
 	cwd string
 
@@ -78,6 +84,7 @@ type model struct {
 	repo *domain.RepositoryInfo
 
 	commits       []domain.CommitSummary
+	refs          []domain.RefSummary
 	files         []domain.FileChange
 	conflictFiles []domain.ConflictFile
 
@@ -90,10 +97,17 @@ type model struct {
 	presetDiffStyle domain.DiffStyle
 	commitDiffStyle domain.DiffStyle
 	compareAnchor   string
+	customCompare   *domain.CompareSelection
 	paletteOpen     bool
 	paletteQuery    string
 	paletteSelected int
 	diffLayout      diffLayout
+	refPickerOpen   bool
+	refPickerQuery  string
+	refPickerStep   int
+	refPickerLeft   *domain.RefSummary
+	refPickerRight  *domain.RefSummary
+	refPickerSelect int
 
 	diff             string
 	conflictContents *domain.ConflictFileContents
@@ -108,7 +122,7 @@ type model struct {
 	fileCache     map[string][]domain.FileChange
 	diffCache     map[string]string
 	conflictCache map[string]domain.ConflictFileContents
-	renderCache   map[string][]string
+	renderCache   map[string]renderedDiff
 }
 
 func NewModel(cwd string) tea.Model {
@@ -123,7 +137,7 @@ func NewModel(cwd string) tea.Model {
 		fileCache:       map[string][]domain.FileChange{},
 		diffCache:       map[string]string{},
 		conflictCache:   map[string]domain.ConflictFileContents{},
-		renderCache:     map[string][]string{},
+		renderCache:     map[string]renderedDiff{},
 	}
 }
 
@@ -147,6 +161,11 @@ func loadRepositoryCmd(cwd string) tea.Cmd {
 			return repoLoadedMsg{err: err}
 		}
 
+		refs, err := gitadapter.ListRefs(ctx, repo.RootPath)
+		if err != nil {
+			return repoLoadedMsg{err: err}
+		}
+
 		conflicts, err := gitadapter.ListConflictFiles(ctx, repo.RootPath)
 		if err != nil {
 			return repoLoadedMsg{err: err}
@@ -155,6 +174,7 @@ func loadRepositoryCmd(cwd string) tea.Cmd {
 		return repoLoadedMsg{
 			repo:      repo,
 			commits:   commits,
+			refs:      refs,
 			conflicts: conflicts,
 		}
 	}
@@ -336,9 +356,110 @@ func (m *model) activeComparison() *domain.CompareSelection {
 			RightLabel: commit.ShortSHA,
 			DiffStyle:  m.commitDiffStyle,
 		}
+	case domain.ModeCompareRefs:
+		if m.customCompare == nil {
+			return nil
+		}
+		return m.customCompare
 	}
 
 	return nil
+}
+
+func (m *model) filteredRefs() []domain.RefSummary {
+	query := strings.ToLower(strings.TrimSpace(m.refPickerQuery))
+	if query == "" {
+		return m.refs
+	}
+
+	filtered := make([]domain.RefSummary, 0, len(m.refs))
+	for _, ref := range m.refs {
+		haystack := strings.ToLower(ref.Name + " " + ref.FullName + " " + ref.ShortSHA + " " + ref.Type)
+		if strings.Contains(haystack, query) {
+			filtered = append(filtered, ref)
+		}
+	}
+	return filtered
+}
+
+func (m *model) selectedRefValue() *domain.RefSummary {
+	refs := m.filteredRefs()
+	if m.refPickerSelect < 0 || m.refPickerSelect >= len(refs) {
+		return nil
+	}
+	ref := refs[m.refPickerSelect]
+	return &ref
+}
+
+func (m *model) openRefPicker() {
+	m.refPickerOpen = true
+	m.refPickerQuery = ""
+	m.refPickerStep = 0
+	m.refPickerLeft = nil
+	m.refPickerRight = nil
+	m.refPickerSelect = 0
+	m.paletteOpen = false
+
+	if m.repo == nil {
+		return
+	}
+
+	for index, ref := range m.refs {
+		if ref.Name == m.repo.HeadRef {
+			copy := ref
+			m.refPickerLeft = &copy
+			m.refPickerStep = 1
+			m.refPickerSelect = index
+			if len(m.refs) > 1 && index == 0 {
+				m.refPickerSelect = 1
+			}
+			return
+		}
+	}
+}
+
+func (m *model) closeRefPicker() {
+	m.refPickerOpen = false
+	m.refPickerQuery = ""
+	m.refPickerSelect = 0
+	m.refPickerStep = 0
+}
+
+func (m *model) applySelectedRefPickerRef() tea.Cmd {
+	selected := m.selectedRefValue()
+	if selected == nil {
+		return nil
+	}
+
+	if m.refPickerStep == 0 {
+		copy := *selected
+		m.refPickerLeft = &copy
+		m.refPickerStep = 1
+		m.refPickerQuery = ""
+		m.refPickerSelect = 0
+		return nil
+	}
+
+	copy := *selected
+	m.refPickerRight = &copy
+	m.refPickerOpen = false
+	m.refPickerQuery = ""
+	m.refPickerStep = 0
+	m.refPickerSelect = 0
+	if m.refPickerLeft == nil || m.refPickerRight == nil {
+		return nil
+	}
+
+	m.customCompare = &domain.CompareSelection{
+		LeftRef:    m.refPickerLeft.Name,
+		RightRef:   m.refPickerRight.Name,
+		LeftLabel:  m.refPickerLeft.Name,
+		RightLabel: m.refPickerRight.Name,
+		DiffStyle:  m.presetDiffStyle,
+	}
+	m.mode = domain.ModeCompareRefs
+	m.actionMessage = fmt.Sprintf("Comparing %s...%s", m.refPickerLeft.Name, m.refPickerRight.Name)
+	return m.refreshFiles()
 }
 
 func (m *model) commitBySHA(sha string) *domain.CommitSummary {
@@ -397,6 +518,55 @@ func (m *model) currentDiffCacheKey() string {
 
 func (m *model) currentRenderCacheKey(width int) string {
 	return fmt.Sprintf("%s:%s:%d", m.currentDiffCacheKey(), m.diffLayout, width)
+}
+
+func (m *model) renderDocument(width int) renderedDiff {
+	cacheKey := m.currentRenderCacheKey(width)
+	if cached, ok := m.renderCache[cacheKey]; ok {
+		return cached
+	}
+
+	document := render.BuildInlineDocument(m.diff, width)
+	if m.diffLayout == diffLayoutSplit {
+		document = render.BuildSideBySideDocument(m.diff, width)
+	}
+
+	rendered := renderedDiff{
+		rows:     document.Rows,
+		hunkRows: document.HunkRows,
+	}
+	m.renderCache[cacheKey] = rendered
+	return rendered
+}
+
+func (m *model) jumpToHunk(direction int, width int) {
+	if m.diff == "" || width <= 0 {
+		return
+	}
+
+	document := m.renderDocument(width)
+	if len(document.hunkRows) == 0 {
+		return
+	}
+
+	if direction > 0 {
+		for _, row := range document.hunkRows {
+			if row > m.diffScroll {
+				m.diffScroll = row
+				return
+			}
+		}
+		m.diffScroll = document.hunkRows[len(document.hunkRows)-1]
+		return
+	}
+
+	for index := len(document.hunkRows) - 1; index >= 0; index-- {
+		if document.hunkRows[index] < m.diffScroll {
+			m.diffScroll = document.hunkRows[index]
+			return
+		}
+	}
+	m.diffScroll = document.hunkRows[0]
 }
 
 func (m *model) currentSelectionLabel() string {
@@ -587,7 +757,7 @@ func (m *model) hardRefresh() tea.Cmd {
 	m.fileCache = map[string][]domain.FileChange{}
 	m.diffCache = map[string]string{}
 	m.conflictCache = map[string]domain.ConflictFileContents{}
-	m.renderCache = map[string][]string{}
+	m.renderCache = map[string]renderedDiff{}
 	return loadRepositoryCmd(m.cwd)
 }
 
@@ -627,6 +797,7 @@ func (m *model) filteredPaletteCommands() []paletteCommand {
 		{id: "focus-commits", label: "Focus commits", description: "Move focus to the commit graph pane"},
 		{id: "focus-files", label: "Focus files", description: "Move focus to the changed files pane"},
 		{id: "focus-diff", label: "Focus diff", description: "Move focus to the diff pane"},
+		{id: "compare-refs", label: "Compare arbitrary refs", description: "Choose any two branches, tags, or refs to compare"},
 		{id: "toggle-layout", label: "Toggle diff layout", description: "Switch between inline and side-by-side diff rendering"},
 		{id: "context-up", label: "Increase context", description: "Show more unchanged lines around each hunk"},
 		{id: "context-down", label: "Decrease context", description: "Show fewer unchanged lines around each hunk"},
@@ -684,6 +855,9 @@ func (m *model) executePaletteCommand(command paletteCommand) tea.Cmd {
 	case "focus-diff":
 		m.focus = focusDiff
 		return nil
+	case "compare-refs":
+		m.openRefPicker()
+		return nil
 	case "context-up":
 		if m.contextLines < 20 {
 			m.contextLines++
@@ -702,11 +876,13 @@ func (m *model) executePaletteCommand(command paletteCommand) tea.Cmd {
 	case "history":
 		if m.mode != domain.ModeConflict {
 			m.mode = domain.ModeHistory
+			m.customCompare = nil
 			return m.refreshFiles()
 		}
 		return nil
 	case "compare-preset":
 		if m.mode != domain.ModeConflict && m.repo != nil && m.repo.DefaultCompareBase != "" {
+			m.customCompare = nil
 			m.mode = domain.ModeComparePreset
 			return m.refreshFiles()
 		}
@@ -734,6 +910,14 @@ func (m *model) executePaletteCommand(command paletteCommand) tea.Cmd {
 				m.commitDiffStyle = domain.DiffThreeDot
 			} else {
 				m.commitDiffStyle = domain.DiffTwoDot
+			}
+			return m.refreshFiles()
+		}
+		if m.mode == domain.ModeCompareRefs && m.customCompare != nil {
+			if m.customCompare.DiffStyle == domain.DiffTwoDot {
+				m.customCompare.DiffStyle = domain.DiffThreeDot
+			} else {
+				m.customCompare.DiffStyle = domain.DiffTwoDot
 			}
 			return m.refreshFiles()
 		}
@@ -769,6 +953,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		repo := msg.repo
 		m.repo = &repo
 		m.commits = msg.commits
+		m.refs = msg.refs
 		m.conflictFiles = msg.conflicts
 		if len(msg.conflicts) > 0 {
 			m.mode = domain.ModeConflict
@@ -836,6 +1021,41 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.actionMessage = msg.message
 		return m, m.hardRefresh()
 	case tea.KeyMsg:
+		if m.refPickerOpen {
+			switch msg.String() {
+			case "esc":
+				m.closeRefPicker()
+				return m, nil
+			case "enter":
+				return m, m.applySelectedRefPickerRef()
+			case "backspace":
+				runes := []rune(m.refPickerQuery)
+				if len(runes) > 0 {
+					m.refPickerQuery = string(runes[:len(runes)-1])
+				}
+				m.refPickerSelect = 0
+				return m, nil
+			case "up", "ctrl+p", "k":
+				refs := m.filteredRefs()
+				if len(refs) > 0 {
+					m.refPickerSelect = clampInt(m.refPickerSelect-1, 0, len(refs)-1)
+				}
+				return m, nil
+			case "down", "ctrl+n", "j":
+				refs := m.filteredRefs()
+				if len(refs) > 0 {
+					m.refPickerSelect = clampInt(m.refPickerSelect+1, 0, len(refs)-1)
+				}
+				return m, nil
+			default:
+				if len(msg.Runes) > 0 && !msg.Alt {
+					m.refPickerQuery += string(msg.Runes)
+					m.refPickerSelect = 0
+				}
+				return m, nil
+			}
+		}
+
 		if m.paletteOpen {
 			switch msg.String() {
 			case "esc":
@@ -894,6 +1114,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.paletteQuery = ""
 			m.paletteSelected = 0
 			return m, nil
+		case "b":
+			m.openRefPicker()
+			return m, nil
 		case "tab":
 			m.focus = paneFocus((int(m.focus) + 1) % 3)
 			return m, nil
@@ -941,8 +1164,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		case "]":
+			m.jumpToHunk(1, m.currentDiffContentWidth())
+			return m, nil
+		case "[":
+			m.jumpToHunk(-1, m.currentDiffContentWidth())
+			return m, nil
 		case "c":
 			if m.mode != domain.ModeConflict && m.repo != nil && m.repo.DefaultCompareBase != "" {
+				m.customCompare = nil
 				if m.mode == domain.ModeComparePreset {
 					m.mode = domain.ModeHistory
 				} else {
@@ -956,6 +1186,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "g":
 			if m.mode != domain.ModeConflict {
+				m.customCompare = nil
 				m.mode = domain.ModeHistory
 				return m, m.refreshFiles()
 			}
@@ -972,8 +1203,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			if m.compareAnchor == commit.SHA {
 				m.compareAnchor = ""
+				m.customCompare = nil
 				m.mode = domain.ModeHistory
 			} else {
+				m.customCompare = nil
 				m.compareAnchor = commit.SHA
 				m.mode = domain.ModeCompareCommits
 			}
@@ -1044,6 +1277,12 @@ func (m *model) View() string {
 		contentHeight -= paletteHeight
 		palette = m.renderPalette(m.width-2, paletteHeight)
 	}
+	refPicker := ""
+	if m.refPickerOpen {
+		pickerHeight := 12
+		contentHeight -= pickerHeight
+		refPicker = m.renderRefPicker(m.width-2, pickerHeight)
+	}
 	if contentHeight < 12 {
 		contentHeight = 12
 	}
@@ -1066,6 +1305,9 @@ func (m *model) View() string {
 	if palette != "" {
 		parts = append(parts, palette)
 	}
+	if refPicker != "" {
+		parts = append(parts, refPicker)
+	}
 	parts = append(parts, panes)
 	return strings.Join(parts, "\n")
 }
@@ -1077,11 +1319,21 @@ func (m *model) currentRepoLabel() string {
 	return fmt.Sprintf("%s | Branch: %s", m.repo.RootPath, m.repo.HeadRef)
 }
 
+func (m *model) currentDiffContentWidth() int {
+	leftWidth := clampInt(m.width/3, 28, 42)
+	midWidth := clampInt(m.width/4, 24, 34)
+	rightWidth := m.width - leftWidth - midWidth - 6
+	if rightWidth < 40 {
+		rightWidth = 40
+	}
+	return maxInt(8, rightWidth-4)
+}
+
 func (m *model) keyHelp() string {
 	if m.mode == domain.ModeConflict {
-		return fmt.Sprintf("Keys: h/j/k/l navigate, tab focus, : palette, i layout (%s), 1 ours, 2 theirs, r refresh, q quit", m.diffLayout)
+		return fmt.Sprintf("Keys: h/j/k/l navigate, tab focus, : palette, b refs, i layout (%s), [ ] hunks, 1 ours, 2 theirs, r refresh, q quit", m.diffLayout)
 	}
-	return fmt.Sprintf("Keys: h/j/k/l navigate, tab focus, : palette, i layout (%s), c compare, v anchor compare, g history, +/- context %d, o editor, r refresh, q quit", m.diffLayout, m.contextLines)
+	return fmt.Sprintf("Keys: h/j/k/l navigate, tab focus, : palette, b refs, i layout (%s), [ ] hunks, c compare, v anchor compare, g history, +/- context %d, o editor, r refresh, q quit", m.diffLayout, m.contextLines)
 }
 
 func (m *model) renderCommitsPane(width, height int) string {
@@ -1144,6 +1396,54 @@ func (m *model) renderPalette(width, height int) string {
 		Render(strings.Join(lines, "\n"))
 }
 
+func (m *model) renderRefPicker(width, height int) string {
+	title := "Compare Refs"
+	step := "Pick left ref"
+	if m.refPickerStep == 1 {
+		step = "Pick right ref"
+	}
+
+	lines := []string{
+		styleAccent.Render(title),
+		styleMuted.Render(step + ". Type to filter. Enter selects. Esc closes."),
+		styleMuted.Render("Left: " + m.refPickerLabel(m.refPickerLeft)),
+		styleMuted.Render("Right: " + m.refPickerLabel(m.refPickerRight)),
+		styleMuted.Render("Query: " + m.refPickerQuery),
+		"",
+	}
+
+	refs := m.filteredRefs()
+	if len(refs) == 0 {
+		lines = append(lines, styleMuted.Render("No matching refs."))
+	} else {
+		start, end := visibleListRange(len(refs), m.refPickerSelect, height-len(lines)-2)
+		for i := start; i < end; i++ {
+			prefix := "  "
+			if i == m.refPickerSelect {
+				prefix = "> "
+			}
+			ref := refs[i]
+			line := fmt.Sprintf("%s%-24s %-7s %s", prefix, trimToWidth(ref.Name, 24), ref.Type, ref.ShortSHA)
+			lines = append(lines, trimToWidth(line, width-4))
+		}
+	}
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color("11")).
+		Width(width).
+		Height(height).
+		Padding(0, 1).
+		Render(strings.Join(lines, "\n"))
+}
+
+func (m *model) refPickerLabel(ref *domain.RefSummary) string {
+	if ref == nil {
+		return "(not set)"
+	}
+	return ref.Name
+}
+
 func (m *model) renderFilesPane(width, height int) string {
 	lines := []string{}
 	title := fmt.Sprintf("Files (%d)", len(m.files))
@@ -1203,35 +1503,53 @@ func (m *model) renderDiffPane(width, height int) string {
 }
 
 func (m *model) renderCommitLine(commit domain.CommitSummary, selected bool, width int) string {
-	prefix := "  "
-	if selected {
-		prefix = "> "
-	}
-
-	anchor := " "
+	anchor := ""
 	if m.compareAnchor == commit.SHA {
 		anchor = "*"
 	}
 
-	baseWidth := lipgloss.Width(prefix + anchor + " " + commit.Graph + " " + commit.ShortSHA + " ")
+	lead := commit.Graph
+	if anchor != "" {
+		if lead != "" {
+			lead = anchor + " " + lead
+		} else {
+			lead = anchor
+		}
+	}
+
+	baseWidth := lipgloss.Width(lead)
+	if lead != "" {
+		baseWidth++
+	}
+	baseWidth += lipgloss.Width(commit.ShortSHA) + 1
 	subjectWidth := width - baseWidth
 	if subjectWidth < 8 {
 		subjectWidth = 8
 	}
 
 	subject := trimToWidth(commit.Subject, subjectWidth)
-	parts := []string{
-		styleMuted.Render(prefix + anchor),
-		styleGraph.Render(" " + commit.Graph),
-		styleSHA.Render(" " + commit.ShortSHA),
-		" " + subject,
+	if selected {
+		lineParts := []string{}
+		if lead != "" {
+			lineParts = append(lineParts, lead)
+		}
+		lineParts = append(lineParts, commit.ShortSHA, subject)
+		line := strings.Join(lineParts, " ")
+		return styleSelectedCommit.Width(width).Render(trimToWidth(line, width))
 	}
 
-	line := lipgloss.JoinHorizontal(lipgloss.Left, parts...)
-	if selected {
-		return styleSelectedCommit.Render(line)
+	parts := []string{
+		styleSHA.Render(commit.ShortSHA),
+		" " + subject,
 	}
-	return line
+	if commit.Graph != "" {
+		parts = append([]string{styleGraph.Render(commit.Graph + " ")}, parts...)
+	}
+	if anchor != "" {
+		parts = append([]string{styleMuted.Render(anchor + " ")}, parts...)
+	}
+
+	return lipgloss.JoinHorizontal(lipgloss.Left, parts...)
 }
 
 func (m *model) renderDiffLines(width, height int) []string {
@@ -1239,22 +1557,13 @@ func (m *model) renderDiffLines(width, height int) []string {
 		return []string{styleMuted.Render("No diff loaded.")}
 	}
 
-	cacheKey := m.currentRenderCacheKey(width)
-	renderedLines, ok := m.renderCache[cacheKey]
-	if !ok {
-		renderedLines = render.RenderInline(m.diff, width)
-		if m.diffLayout == diffLayoutSplit {
-			renderedLines = render.RenderSideBySide(m.diff, width)
-		}
-		m.renderCache[cacheKey] = renderedLines
+	document := m.renderDocument(width)
+	if m.diffScroll > len(document.rows)-1 {
+		m.diffScroll = maxInt(0, len(document.rows)-1)
 	}
 
-	if m.diffScroll > len(renderedLines)-1 {
-		m.diffScroll = maxInt(0, len(renderedLines)-1)
-	}
-
-	end := minInt(len(renderedLines), m.diffScroll+height)
-	return renderedLines[m.diffScroll:end]
+	end := minInt(len(document.rows), m.diffScroll+height)
+	return document.rows[m.diffScroll:end]
 }
 
 func (m *model) renderConflictContents(width int) []string {
@@ -1320,7 +1629,10 @@ var (
 	styleDefault        = lipgloss.NewStyle()
 	styleGraph          = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
 	styleSHA            = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
-	styleSelectedCommit = lipgloss.NewStyle().Bold(true)
+	styleSelectedCommit = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("230")).
+				Background(lipgloss.Color("25")).
+				Bold(true)
 )
 
 func trimToWidth(value string, width int) string {

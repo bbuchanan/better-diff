@@ -58,6 +58,35 @@ func TestListCommits(t *testing.T) {
 	}
 }
 
+func TestListRefs(t *testing.T) {
+	ctx, cancel := Context(5 * time.Second)
+	defer cancel()
+
+	refs, err := ListRefs(ctx, smokeRepoPath(t))
+	if err != nil {
+		t.Fatalf("ListRefs returned error: %v", err)
+	}
+
+	if len(refs) < 2 {
+		t.Fatalf("expected at least 2 refs, got %d", len(refs))
+	}
+
+	foundFeature := false
+	foundMaster := false
+	for _, ref := range refs {
+		if ref.Name == "feature" && ref.Type == "branch" {
+			foundFeature = true
+		}
+		if ref.Name == "master" && ref.Type == "branch" {
+			foundMaster = true
+		}
+	}
+
+	if !foundFeature || !foundMaster {
+		t.Fatalf("expected feature and master branches in refs, got %+v", refs)
+	}
+}
+
 func TestListCommitFilesAndDiff(t *testing.T) {
 	ctx, cancel := Context(5 * time.Second)
 	defer cancel()

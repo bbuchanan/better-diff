@@ -13,6 +13,7 @@ const (
 	ModeHistory        ExplorerMode = "history"
 	ModeComparePreset  ExplorerMode = "compare-preset"
 	ModeCompareCommits ExplorerMode = "compare-commits"
+	ModeCompareRefs    ExplorerMode = "compare-refs"
 	ModeConflict       ExplorerMode = "conflict"
 )
 
@@ -43,11 +44,18 @@ type FileChange struct {
 }
 
 type CompareSelection struct {
-	LeftRef   string
-	RightRef  string
-	LeftLabel string
+	LeftRef    string
+	RightRef   string
+	LeftLabel  string
 	RightLabel string
-	DiffStyle DiffStyle
+	DiffStyle  DiffStyle
+}
+
+type RefSummary struct {
+	Name     string
+	FullName string
+	ShortSHA string
+	Type     string
 }
 
 type ConflictFile struct {

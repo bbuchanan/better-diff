@@ -25,6 +25,22 @@ index 1111111..2222222 100644
 +const message = "this is a deliberately long line for wrapping behavior in the add column"
 `
 
+const multiHunkDiff = `diff --git a/demo.go b/demo.go
+index 1111111..2222222 100644
+--- a/demo.go
++++ b/demo.go
+@@ -1,3 +1,3 @@
+-func alpha() string {
++func alpha() int {
+ 	return 1
+ }
+@@ -10,3 +10,3 @@
+-func beta() string {
++func beta() int {
+ 	return 2
+ }
+`
+
 func TestParseUnifiedDiff(t *testing.T) {
 	parsed := ParseUnifiedDiff(sampleDiff)
 	if len(parsed.Files) != 1 {
@@ -85,6 +101,24 @@ func TestRenderSideBySideWrapsLongLines(t *testing.T) {
 	}
 	if len(lines) < 6 {
 		t.Fatalf("expected wrapped side-by-side output to expand line count, got %d", len(lines))
+	}
+}
+
+func TestBuildDocumentsTrackHunkRows(t *testing.T) {
+	inline := BuildInlineDocument(multiHunkDiff, 100)
+	if got, want := len(inline.HunkRows), 2; got != want {
+		t.Fatalf("inline HunkRows = %d, want %d", got, want)
+	}
+	if inline.HunkRows[1] <= inline.HunkRows[0] {
+		t.Fatalf("expected inline hunk rows to increase, got %+v", inline.HunkRows)
+	}
+
+	split := BuildSideBySideDocument(multiHunkDiff, 120)
+	if got, want := len(split.HunkRows), 2; got != want {
+		t.Fatalf("split HunkRows = %d, want %d", got, want)
+	}
+	if split.HunkRows[1] <= split.HunkRows[0] {
+		t.Fatalf("expected split hunk rows to increase, got %+v", split.HunkRows)
 	}
 }
 
