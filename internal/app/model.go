@@ -108,6 +108,7 @@ type model struct {
 	fileCache     map[string][]domain.FileChange
 	diffCache     map[string]string
 	conflictCache map[string]domain.ConflictFileContents
+	renderCache   map[string][]string
 }
 
 func NewModel(cwd string) tea.Model {
@@ -122,6 +123,7 @@ func NewModel(cwd string) tea.Model {
 		fileCache:       map[string][]domain.FileChange{},
 		diffCache:       map[string]string{},
 		conflictCache:   map[string]domain.ConflictFileContents{},
+		renderCache:     map[string][]string{},
 	}
 }
 
@@ -393,6 +395,10 @@ func (m *model) currentDiffCacheKey() string {
 	return fmt.Sprintf("commit:%s:%s:%d", commit.SHA, path, m.contextLines)
 }
 
+func (m *model) currentRenderCacheKey(width int) string {
+	return fmt.Sprintf("%s:%s:%d", m.currentDiffCacheKey(), m.diffLayout, width)
+}
+
 func (m *model) currentSelectionLabel() string {
 	if m.mode == domain.ModeConflict {
 		return "Conflict Mode"
@@ -581,6 +587,7 @@ func (m *model) hardRefresh() tea.Cmd {
 	m.fileCache = map[string][]domain.FileChange{}
 	m.diffCache = map[string]string{}
 	m.conflictCache = map[string]domain.ConflictFileContents{}
+	m.renderCache = map[string][]string{}
 	return loadRepositoryCmd(m.cwd)
 }
 
@@ -1232,10 +1239,16 @@ func (m *model) renderDiffLines(width, height int) []string {
 		return []string{styleMuted.Render("No diff loaded.")}
 	}
 
-	renderedLines := render.RenderInline(m.diff, width)
-	if m.diffLayout == diffLayoutSplit {
-		renderedLines = render.RenderSideBySide(m.diff, width)
+	cacheKey := m.currentRenderCacheKey(width)
+	renderedLines, ok := m.renderCache[cacheKey]
+	if !ok {
+		renderedLines = render.RenderInline(m.diff, width)
+		if m.diffLayout == diffLayoutSplit {
+			renderedLines = render.RenderSideBySide(m.diff, width)
+		}
+		m.renderCache[cacheKey] = renderedLines
 	}
+
 	if m.diffScroll > len(renderedLines)-1 {
 		m.diffScroll = maxInt(0, len(renderedLines)-1)
 	}
