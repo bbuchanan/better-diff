@@ -1331,9 +1331,9 @@ func (m *model) currentDiffContentWidth() int {
 
 func (m *model) keyHelp() string {
 	if m.mode == domain.ModeConflict {
-		return fmt.Sprintf("Keys: h/j/k/l navigate, tab focus, : palette, b refs, i layout (%s), [ ] hunks, 1 ours, 2 theirs, r refresh, q quit", m.diffLayout)
+		return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, : palette, b refs, i layout (%s), [ ] hunks, 1 ours, 2 theirs, r refresh, q quit", m.diffLayout)
 	}
-	return fmt.Sprintf("Keys: h/j/k/l navigate, tab focus, : palette, b refs, i layout (%s), [ ] hunks, c compare, v anchor compare, g history, +/- context %d, o editor, r refresh, q quit", m.diffLayout, m.contextLines)
+	return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, selected file drives diff, : palette, b refs, i layout (%s), [ ] hunks, c compare, v anchor compare, g history, +/- context %d, o editor, r refresh, q quit", m.diffLayout, m.contextLines)
 }
 
 func (m *model) renderCommitsPane(width, height int) string {
@@ -1447,6 +1447,9 @@ func (m *model) refPickerLabel(ref *domain.RefSummary) string {
 func (m *model) renderFilesPane(width, height int) string {
 	lines := []string{}
 	title := fmt.Sprintf("Files (%d)", len(m.files))
+	if m.focus == focusFiles {
+		title += " [j/k selects diff]"
+	}
 	if m.loadingFiles {
 		lines = append(lines, styleAccent.Render("Loading files..."))
 	}
@@ -1457,19 +1460,20 @@ func (m *model) renderFilesPane(width, height int) string {
 	start, end := visibleListRange(len(m.files), m.selectedFile, height-2-len(lines))
 	for i := start; i < end; i++ {
 		file := m.files[i]
-		prefix := "  "
-		if i == m.selectedFile {
-			prefix = "> "
-		}
-		statusColor := styleDefault
-		if file.Status == "U" {
-			statusColor = styleError
-		}
-		line := prefix + file.Status + " " + file.Path
+		line := file.Status + " " + file.Path
 		if file.OldPath != "" {
 			line += " <- " + file.OldPath
 		}
-		lines = append(lines, statusColor.Render(trimToWidth(line, width-4)))
+		line = trimToWidth(line, width-4)
+
+		switch {
+		case i == m.selectedFile:
+			lines = append(lines, styleSelectedFile.Width(width-4).Render(line))
+		case file.Status == "U":
+			lines = append(lines, styleError.Render(line))
+		default:
+			lines = append(lines, styleDefault.Render(line))
+		}
 	}
 
 	if len(lines) == 0 {
@@ -1632,6 +1636,10 @@ var (
 	styleSelectedCommit = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("230")).
 				Background(lipgloss.Color("25")).
+				Bold(true)
+	styleSelectedFile = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("230")).
+				Background(lipgloss.Color("24")).
 				Bold(true)
 )
 
