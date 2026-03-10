@@ -24,7 +24,15 @@ type Diff struct {
 
 type Document struct {
 	Rows     []string
+	RowMeta  []RowMeta
 	HunkRows []int
+}
+
+type RowMeta struct {
+	Kind         LineKind
+	OldLine      int
+	NewLine      int
+	Continuation bool
 }
 
 type File struct {
@@ -232,7 +240,7 @@ func RenderInline(diffText string, width int) []string {
 func BuildInlineDocument(diffText string, width int) Document {
 	parsed := ParseUnifiedDiff(diffText)
 	if len(parsed.Files) == 0 {
-		return Document{Rows: []string{styleFileMeta.Render("No diff loaded.")}}
+		return Document{Rows: []string{styleFileMeta.Render("No diff loaded.")}, RowMeta: []RowMeta{{}}}
 	}
 
 	if width < 24 {
@@ -240,25 +248,42 @@ func BuildInlineDocument(diffText string, width int) Document {
 	}
 
 	lines := make([]string, 0, 64)
+	rowMeta := make([]RowMeta, 0, 64)
 	hunkRows := []int{}
 	for fileIndex, file := range parsed.Files {
 		if fileIndex > 0 {
 			lines = append(lines, "")
+			rowMeta = append(rowMeta, RowMeta{})
 		}
 
 		lines = append(lines, renderFileHeader(file, width))
-		lines = append(lines, renderFileMetadata(file, width)...)
+		rowMeta = append(rowMeta, RowMeta{})
+		metadata := renderFileMetadata(file, width)
+		lines = append(lines, metadata...)
+		for range metadata {
+			rowMeta = append(rowMeta, RowMeta{})
+		}
 
 		for _, hunk := range file.Hunks {
 			hunkRows = append(hunkRows, len(lines))
 			lines = append(lines, trimStyled(styleHunkHeader.Width(width).Render(trimPlain(" "+hunk.Header+" ", width)), width))
+			rowMeta = append(rowMeta, RowMeta{})
 			for _, plan := range buildRenderPlans(hunk, detectLanguage(file.NewPath, file.OldPath)) {
-				lines = append(lines, renderPlanLines(plan, width)...)
+				planLines := renderPlanLines(plan, width)
+				lines = append(lines, planLines...)
+				for index := range planLines {
+					rowMeta = append(rowMeta, RowMeta{
+						Kind:         plan.kind,
+						OldLine:      plan.oldLine,
+						NewLine:      plan.newLine,
+						Continuation: index > 0,
+					})
+				}
 			}
 		}
 	}
 
-	return Document{Rows: lines, HunkRows: hunkRows}
+	return Document{Rows: lines, RowMeta: rowMeta, HunkRows: hunkRows}
 }
 
 func RenderSideBySide(diffText string, width int) []string {
@@ -268,7 +293,7 @@ func RenderSideBySide(diffText string, width int) []string {
 func BuildSideBySideDocument(diffText string, width int) Document {
 	parsed := ParseUnifiedDiff(diffText)
 	if len(parsed.Files) == 0 {
-		return Document{Rows: []string{styleFileMeta.Render("No diff loaded.")}}
+		return Document{Rows: []string{styleFileMeta.Render("No diff loaded.")}, RowMeta: []RowMeta{{}}}
 	}
 
 	if width < 72 {
@@ -277,29 +302,72 @@ func BuildSideBySideDocument(diffText string, width int) Document {
 
 	columnWidth := maxInt(28, (width-3)/2)
 	lines := make([]string, 0, 64)
+	rowMeta := make([]RowMeta, 0, 64)
 	hunkRows := []int{}
 	for fileIndex, file := range parsed.Files {
 		if fileIndex > 0 {
 			lines = append(lines, "")
+			rowMeta = append(rowMeta, RowMeta{})
 		}
 
 		lines = append(lines, renderFileHeader(file, width))
-		lines = append(lines, renderFileMetadata(file, width)...)
+		rowMeta = append(rowMeta, RowMeta{})
+		metadata := renderFileMetadata(file, width)
+		lines = append(lines, metadata...)
+		for range metadata {
+			rowMeta = append(rowMeta, RowMeta{})
+		}
 
 		leftLabel := trimStyled(styleSplitHeader.Width(columnWidth).Render(" OLD "), columnWidth)
 		rightLabel := trimStyled(styleSplitHeader.Width(columnWidth).Render(" NEW "), columnWidth)
 		lines = append(lines, joinColumns(leftLabel, rightLabel))
+		rowMeta = append(rowMeta, RowMeta{})
 
 		for _, hunk := range file.Hunks {
 			hunkRows = append(hunkRows, len(lines))
 			lines = append(lines, trimStyled(styleHunkHeader.Width(width).Render(trimPlain(" "+hunk.Header+" ", width)), width))
+			rowMeta = append(rowMeta, RowMeta{})
 			for _, row := range buildSideBySideRows(hunk, detectLanguage(file.NewPath, file.OldPath)) {
-				lines = append(lines, renderSideBySideRowLines(row, columnWidth)...)
+				rowLines := renderSideBySideRowLines(row, columnWidth)
+				lines = append(lines, rowLines...)
+				meta := rowMetaForSideBySideRow(row)
+				for index := range rowLines {
+					meta.Continuation = index > 0
+					rowMeta = append(rowMeta, meta)
+				}
 			}
 		}
 	}
 
-	return Document{Rows: lines, HunkRows: hunkRows}
+	return Document{Rows: lines, RowMeta: rowMeta, HunkRows: hunkRows}
+}
+
+func rowMetaForSideBySideRow(row sideBySideRow) RowMeta {
+	if row.right != nil && row.right.kind != LineMeta {
+		return RowMeta{
+			Kind:    row.right.kind,
+			OldLine: lineNumberForPlan(row.left, true),
+			NewLine: lineNumberForPlan(row.right, false),
+		}
+	}
+	if row.left != nil && row.left.kind != LineMeta {
+		return RowMeta{
+			Kind:    row.left.kind,
+			OldLine: lineNumberForPlan(row.left, true),
+			NewLine: lineNumberForPlan(row.right, false),
+		}
+	}
+	return RowMeta{}
+}
+
+func lineNumberForPlan(plan *renderPlan, old bool) int {
+	if plan == nil {
+		return 0
+	}
+	if old {
+		return plan.oldLine
+	}
+	return plan.newLine
 }
 
 func buildRenderPlans(hunk Hunk, language string) []renderPlan {
@@ -1057,15 +1125,50 @@ func wrapPlainText(value string, width int) []wrappedChunk {
 	}
 
 	chunks := make([]wrappedChunk, 0, (len(runes)/width)+1)
-	for start := 0; start < len(runes); start += width {
+	for start := 0; start < len(runes); {
 		end := minInt(len(runes), start+width)
+		if end < len(runes) {
+			if breakpoint := preferredWrapBreakpoint(runes, start, end); breakpoint > start {
+				end = breakpoint
+			}
+		}
 		chunks = append(chunks, wrappedChunk{
 			text:  string(runes[start:end]),
 			start: start,
 			end:   end,
 		})
+		start = end
 	}
 	return chunks
+}
+
+func preferredWrapBreakpoint(runes []rune, start, end int) int {
+	for index := end - 1; index > start; index-- {
+		if isWrapWhitespace(runes[index]) {
+			return index + 1
+		}
+	}
+
+	for index := end - 1; index > start; index-- {
+		if isWrapPunctuation(runes[index]) {
+			return index + 1
+		}
+	}
+
+	return end
+}
+
+func isWrapWhitespace(r rune) bool {
+	return r == ' ' || r == '\t'
+}
+
+func isWrapPunctuation(r rune) bool {
+	switch r {
+	case ',', '.', ')', '(', '{', '}', '[', ']', '+', '-', '=', ':', ';', '/':
+		return true
+	default:
+		return false
+	}
 }
 
 func sliceRunes(value string, start, end int) string {

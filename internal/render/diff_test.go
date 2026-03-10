@@ -109,6 +109,9 @@ func TestBuildDocumentsTrackHunkRows(t *testing.T) {
 	if got, want := len(inline.HunkRows), 2; got != want {
 		t.Fatalf("inline HunkRows = %d, want %d", got, want)
 	}
+	if len(inline.RowMeta) != len(inline.Rows) {
+		t.Fatalf("inline RowMeta length = %d, want %d", len(inline.RowMeta), len(inline.Rows))
+	}
 	if inline.HunkRows[1] <= inline.HunkRows[0] {
 		t.Fatalf("expected inline hunk rows to increase, got %+v", inline.HunkRows)
 	}
@@ -116,6 +119,9 @@ func TestBuildDocumentsTrackHunkRows(t *testing.T) {
 	split := BuildSideBySideDocument(multiHunkDiff, 120)
 	if got, want := len(split.HunkRows), 2; got != want {
 		t.Fatalf("split HunkRows = %d, want %d", got, want)
+	}
+	if len(split.RowMeta) != len(split.Rows) {
+		t.Fatalf("split RowMeta length = %d, want %d", len(split.RowMeta), len(split.Rows))
 	}
 	if split.HunkRows[1] <= split.HunkRows[0] {
 		t.Fatalf("expected split hunk rows to increase, got %+v", split.HunkRows)
@@ -130,5 +136,30 @@ func TestChangedSpan(t *testing.T) {
 	}
 	if left.start != left.end {
 		t.Fatalf("expected insertion-only change to keep left span empty, got %+v", left)
+	}
+}
+
+func TestWrapPlainTextPrefersCodeBoundaries(t *testing.T) {
+	chunks := wrapPlainText(`return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane")`, 20)
+	if len(chunks) < 2 {
+		t.Fatalf("expected wrapped chunks, got %+v", chunks)
+	}
+
+	first := chunks[0].text
+	if strings.HasSuffix(first, "pan") || strings.HasSuffix(first, "swit") {
+		t.Fatalf("expected first chunk to avoid mid-token split, got %q", first)
+	}
+	if !strings.HasSuffix(first, " ") && !strings.HasSuffix(first, "(") && !strings.HasSuffix(first, ":") {
+		t.Fatalf("expected first chunk to end on a natural boundary, got %q", first)
+	}
+}
+
+func TestWrapPlainTextHardWrapsLongToken(t *testing.T) {
+	chunks := wrapPlainText("supercalifragilisticexpialidocious", 10)
+	if got, want := len(chunks), 4; got != want {
+		t.Fatalf("chunk count = %d, want %d", got, want)
+	}
+	if chunks[0].text != "supercalif" {
+		t.Fatalf("unexpected first chunk: %q", chunks[0].text)
 	}
 }

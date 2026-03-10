@@ -59,6 +59,12 @@ type diffLoadedMsg struct {
 	err      error
 }
 
+type blameLoadedMsg struct {
+	key   string
+	lines map[int]domain.BlameLine
+	err   error
+}
+
 type actionDoneMsg struct {
 	message string
 	err     error
@@ -72,6 +78,7 @@ type paletteCommand struct {
 
 type renderedDiff struct {
 	rows     []string
+	rowMeta  []render.RowMeta
 	hunkRows []int
 }
 
@@ -94,6 +101,7 @@ type model struct {
 	selectedFile       int
 	diffScroll         int
 	contextLines       int
+	ignoreWhitespace   bool
 	presetDiffStyle    domain.DiffStyle
 	commitDiffStyle    domain.DiffStyle
 	compareAnchor      string
@@ -112,6 +120,8 @@ type model struct {
 	commitPickerQuery  string
 	commitPickerSelect int
 	preferredFilePath  string
+	showBlame          bool
+	blameDetailOpen    bool
 
 	diff             string
 	conflictContents *domain.ConflictFileContents
@@ -127,21 +137,25 @@ type model struct {
 	diffCache     map[string]string
 	conflictCache map[string]domain.ConflictFileContents
 	renderCache   map[string]renderedDiff
+	blameCache    map[string]map[int]domain.BlameLine
 }
 
 func NewModel(cwd string) tea.Model {
 	return &model{
-		cwd:             cwd,
-		mode:            domain.ModeHistory,
-		focus:           focusCommits,
-		contextLines:    3,
-		presetDiffStyle: domain.DiffThreeDot,
-		commitDiffStyle: domain.DiffTwoDot,
-		diffLayout:      diffLayoutInline,
-		fileCache:       map[string][]domain.FileChange{},
-		diffCache:       map[string]string{},
-		conflictCache:   map[string]domain.ConflictFileContents{},
-		renderCache:     map[string]renderedDiff{},
+		cwd:              cwd,
+		mode:             domain.ModeHistory,
+		focus:            focusCommits,
+		contextLines:     3,
+		ignoreWhitespace: true,
+		presetDiffStyle:  domain.DiffThreeDot,
+		commitDiffStyle:  domain.DiffTwoDot,
+		diffLayout:       diffLayoutInline,
+		showBlame:        true,
+		fileCache:        map[string][]domain.FileChange{},
+		diffCache:        map[string]string{},
+		conflictCache:    map[string]domain.ConflictFileContents{},
+		renderCache:      map[string]renderedDiff{},
+		blameCache:       map[string]map[int]domain.BlameLine{},
 	}
 }
 
@@ -185,23 +199,37 @@ func loadRepositoryCmd(cwd string) tea.Cmd {
 }
 
 func loadCommitFilesCmd(root, sha string) tea.Cmd {
+	return loadCommitFilesCmdWithOptions(root, sha, false)
+}
+
+func loadCommitFilesCmdWithOptions(root, sha string, ignoreWhitespace bool) tea.Cmd {
 	key := "commit:" + sha
+	if ignoreWhitespace {
+		key += ":ws"
+	}
 	return func() tea.Msg {
 		ctx, cancel := gitadapter.Context(5 * time.Second)
 		defer cancel()
 
-		files, err := gitadapter.ListCommitFiles(ctx, root, sha)
+		files, err := gitadapter.ListCommitFilesWithOptions(ctx, root, sha, ignoreWhitespace)
 		return filesLoadedMsg{key: key, files: files, err: err}
 	}
 }
 
 func prefetchCommitFilesCmd(root, sha string) tea.Cmd {
+	return prefetchCommitFilesCmdWithOptions(root, sha, false)
+}
+
+func prefetchCommitFilesCmdWithOptions(root, sha string, ignoreWhitespace bool) tea.Cmd {
 	key := "commit:" + sha
+	if ignoreWhitespace {
+		key += ":ws"
+	}
 	return func() tea.Msg {
 		ctx, cancel := gitadapter.Context(5 * time.Second)
 		defer cancel()
 
-		files, err := gitadapter.ListCommitFiles(ctx, root, sha)
+		files, err := gitadapter.ListCommitFilesWithOptions(ctx, root, sha, ignoreWhitespace)
 		if err != nil {
 			return prefetchedFilesMsg{key: key}
 		}
@@ -210,45 +238,73 @@ func prefetchCommitFilesCmd(root, sha string) tea.Cmd {
 }
 
 func loadRangeFilesCmd(root string, compare domain.CompareSelection) tea.Cmd {
+	return loadRangeFilesCmdWithOptions(root, compare, false)
+}
+
+func loadRangeFilesCmdWithOptions(root string, compare domain.CompareSelection, ignoreWhitespace bool) tea.Cmd {
 	key := fmt.Sprintf("range:%s:%s:%s", compare.LeftRef, compare.DiffStyle, compare.RightRef)
+	if ignoreWhitespace {
+		key += ":ws"
+	}
 	return func() tea.Msg {
 		ctx, cancel := gitadapter.Context(5 * time.Second)
 		defer cancel()
 
-		files, err := gitadapter.ListRangeFiles(ctx, root, compare.LeftRef, compare.RightRef, compare.DiffStyle)
+		files, err := gitadapter.ListRangeFilesWithOptions(ctx, root, compare.LeftRef, compare.RightRef, compare.DiffStyle, ignoreWhitespace)
 		return filesLoadedMsg{key: key, files: files, err: err}
 	}
 }
 
 func loadCommitDiffCmd(root, sha, path string, contextLines int) tea.Cmd {
+	return loadCommitDiffCmdWithOptions(root, sha, path, contextLines, false)
+}
+
+func loadCommitDiffCmdWithOptions(root, sha, path string, contextLines int, ignoreWhitespace bool) tea.Cmd {
 	key := fmt.Sprintf("commit:%s:%s:%d", sha, path, contextLines)
+	if ignoreWhitespace {
+		key += ":ws"
+	}
 	return func() tea.Msg {
 		ctx, cancel := gitadapter.Context(8 * time.Second)
 		defer cancel()
 
-		diff, err := gitadapter.GetCommitDiff(ctx, root, sha, path, contextLines)
+		diff, err := gitadapter.GetCommitDiffWithOptions(ctx, root, sha, path, contextLines, ignoreWhitespace)
 		return diffLoadedMsg{key: key, diff: diff, err: err}
 	}
 }
 
 func loadRangeDiffCmd(root string, compare domain.CompareSelection, path string, contextLines int) tea.Cmd {
+	return loadRangeDiffCmdWithOptions(root, compare, path, contextLines, false)
+}
+
+func loadRangeDiffCmdWithOptions(root string, compare domain.CompareSelection, path string, contextLines int, ignoreWhitespace bool) tea.Cmd {
 	key := fmt.Sprintf("range:%s:%s:%s:%s:%d", compare.LeftRef, compare.DiffStyle, compare.RightRef, path, contextLines)
+	if ignoreWhitespace {
+		key += ":ws"
+	}
 	return func() tea.Msg {
 		ctx, cancel := gitadapter.Context(8 * time.Second)
 		defer cancel()
 
-		diff, err := gitadapter.GetRangeDiff(ctx, root, compare.LeftRef, compare.RightRef, compare.DiffStyle, path, contextLines)
+		diff, err := gitadapter.GetRangeDiffWithOptions(ctx, root, compare.LeftRef, compare.RightRef, compare.DiffStyle, path, contextLines, ignoreWhitespace)
 		return diffLoadedMsg{key: key, diff: diff, err: err}
 	}
 }
 
 func prefetchCommitDiffCmd(root, sha, path string, contextLines int) tea.Cmd {
+	return prefetchCommitDiffCmdWithOptions(root, sha, path, contextLines, false)
+}
+
+func prefetchCommitDiffCmdWithOptions(root, sha, path string, contextLines int, ignoreWhitespace bool) tea.Cmd {
 	key := fmt.Sprintf("commit:%s:%s:%d", sha, path, contextLines)
+	if ignoreWhitespace {
+		key += ":ws"
+	}
 	return func() tea.Msg {
 		ctx, cancel := gitadapter.Context(8 * time.Second)
 		defer cancel()
 
-		diff, err := gitadapter.GetCommitDiff(ctx, root, sha, path, contextLines)
+		diff, err := gitadapter.GetCommitDiffWithOptions(ctx, root, sha, path, contextLines, ignoreWhitespace)
 		if err != nil {
 			return prefetchedDiffMsg{}
 		}
@@ -257,12 +313,19 @@ func prefetchCommitDiffCmd(root, sha, path string, contextLines int) tea.Cmd {
 }
 
 func prefetchRangeDiffCmd(root string, compare domain.CompareSelection, path string, contextLines int) tea.Cmd {
+	return prefetchRangeDiffCmdWithOptions(root, compare, path, contextLines, false)
+}
+
+func prefetchRangeDiffCmdWithOptions(root string, compare domain.CompareSelection, path string, contextLines int, ignoreWhitespace bool) tea.Cmd {
 	key := fmt.Sprintf("range:%s:%s:%s:%s:%d", compare.LeftRef, compare.DiffStyle, compare.RightRef, path, contextLines)
+	if ignoreWhitespace {
+		key += ":ws"
+	}
 	return func() tea.Msg {
 		ctx, cancel := gitadapter.Context(8 * time.Second)
 		defer cancel()
 
-		diff, err := gitadapter.GetRangeDiff(ctx, root, compare.LeftRef, compare.RightRef, compare.DiffStyle, path, contextLines)
+		diff, err := gitadapter.GetRangeDiffWithOptions(ctx, root, compare.LeftRef, compare.RightRef, compare.DiffStyle, path, contextLines, ignoreWhitespace)
 		if err != nil {
 			return prefetchedDiffMsg{}
 		}
@@ -284,6 +347,17 @@ func loadConflictContentsCmd(root, path string) tea.Cmd {
 			key:      "conflict:" + path,
 			conflict: &contents,
 		}
+	}
+}
+
+func loadBlameCmd(root, revision, path string) tea.Cmd {
+	key := revision + ":" + path
+	return func() tea.Msg {
+		ctx, cancel := gitadapter.Context(8 * time.Second)
+		defer cancel()
+
+		lines, err := gitadapter.GetBlame(ctx, root, revision, path)
+		return blameLoadedMsg{key: key, lines: lines, err: err}
 	}
 }
 
@@ -545,6 +619,174 @@ func selectFileIndexByPath(files []domain.FileChange, path string) int {
 	return 0
 }
 
+type blameTarget struct {
+	revision string
+	path     string
+}
+
+func blameCacheKey(revision, path string) string {
+	return revision + ":" + path
+}
+
+func (m *model) leftBlameTarget() *blameTarget {
+	file := m.selectedFileValue()
+	if m.repo == nil || file == nil {
+		return nil
+	}
+
+	path := file.Path
+	if file.OldPath != "" {
+		path = file.OldPath
+	}
+
+	if compare := m.activeComparison(); compare != nil {
+		if compare.LeftRef == "" || path == "" {
+			return nil
+		}
+		return &blameTarget{revision: compare.LeftRef, path: path}
+	}
+
+	commit := m.selectedCommitValue()
+	if commit == nil || path == "" {
+		return nil
+	}
+	return &blameTarget{revision: commit.SHA + "^", path: path}
+}
+
+func (m *model) rightBlameTarget() *blameTarget {
+	file := m.selectedFileValue()
+	if m.repo == nil || file == nil || file.Path == "" {
+		return nil
+	}
+
+	if compare := m.activeComparison(); compare != nil {
+		if compare.RightRef == "" {
+			return nil
+		}
+		return &blameTarget{revision: compare.RightRef, path: file.Path}
+	}
+
+	commit := m.selectedCommitValue()
+	if commit == nil {
+		return nil
+	}
+	return &blameTarget{revision: commit.SHA, path: file.Path}
+}
+
+func (m *model) currentBlameTargets() []blameTarget {
+	targets := []blameTarget{}
+	seen := map[string]struct{}{}
+	for _, target := range []*blameTarget{m.leftBlameTarget(), m.rightBlameTarget()} {
+		if target == nil {
+			continue
+		}
+		key := blameCacheKey(target.revision, target.path)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, *target)
+	}
+	return targets
+}
+
+func (m *model) maybeLoadBlame() tea.Cmd {
+	if !m.showBlame || m.repo == nil || m.mode == domain.ModeConflict {
+		return nil
+	}
+
+	cmds := []tea.Cmd{}
+	for _, target := range m.currentBlameTargets() {
+		key := blameCacheKey(target.revision, target.path)
+		if _, ok := m.blameCache[key]; ok {
+			continue
+		}
+		cmds = append(cmds, loadBlameCmd(m.repo.RootPath, target.revision, target.path))
+	}
+	return tea.Batch(cmds...)
+}
+
+func (m *model) blameLineForMeta(meta render.RowMeta) *domain.BlameLine {
+	if meta.Continuation {
+		return nil
+	}
+
+	if meta.Kind == render.LineDelete && meta.OldLine > 0 {
+		target := m.leftBlameTarget()
+		if target == nil {
+			return nil
+		}
+		if lines, ok := m.blameCache[blameCacheKey(target.revision, target.path)]; ok {
+			if blame, ok := lines[meta.OldLine]; ok {
+				copy := blame
+				return &copy
+			}
+		}
+		return nil
+	}
+
+	if meta.NewLine > 0 {
+		target := m.rightBlameTarget()
+		if target == nil {
+			return nil
+		}
+		if lines, ok := m.blameCache[blameCacheKey(target.revision, target.path)]; ok {
+			if blame, ok := lines[meta.NewLine]; ok {
+				copy := blame
+				return &copy
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *model) currentVisibleBlame(width, height int) *domain.BlameLine {
+	document := m.renderDocument(m.diffRenderWidth(width))
+	if len(document.rows) == 0 {
+		return nil
+	}
+
+	end := minInt(len(document.rows), m.diffScroll+height)
+	for index := m.diffScroll; index < end && index < len(document.rowMeta); index++ {
+		if blame := m.blameLineForMeta(document.rowMeta[index]); blame != nil {
+			return blame
+		}
+	}
+
+	return nil
+}
+
+func blameSummary(blame *domain.BlameLine) string {
+	if blame == nil {
+		return ""
+	}
+
+	parts := []string{}
+	if blame.AuthorName != "" {
+		parts = append(parts, blame.AuthorName)
+	}
+	if blame.ShortSHA != "" {
+		parts = append(parts, blame.ShortSHA)
+	}
+	if blame.Summary != "" {
+		parts = append(parts, blame.Summary)
+	}
+	return strings.Join(parts, "  ")
+}
+
+func renderBlameSeparator(summary string, width int) string {
+	if width <= 0 || summary == "" {
+		return ""
+	}
+	label := "  " + summary + " "
+	if lipgloss.Width(label) > width {
+		label = "  " + trimToWidth(summary, maxInt(1, width-2))
+	}
+	fillWidth := maxInt(0, width-lipgloss.Width(label))
+	return styleMuted.Render(label + strings.Repeat("─", fillWidth))
+}
+
 func (m *model) commitBySHA(sha string) *domain.CommitSummary {
 	for _, commit := range m.commits {
 		if commit.SHA == sha {
@@ -560,8 +802,13 @@ func (m *model) currentFileCacheKey() string {
 		return "conflict"
 	}
 
+	ws := ""
+	if m.ignoreWhitespace {
+		ws = ":ws"
+	}
+
 	if compare := m.activeComparison(); compare != nil {
-		return fmt.Sprintf("range:%s:%s:%s", compare.LeftRef, compare.DiffStyle, compare.RightRef)
+		return fmt.Sprintf("range:%s:%s:%s%s", compare.LeftRef, compare.DiffStyle, compare.RightRef, ws)
 	}
 
 	commit := m.selectedCommitValue()
@@ -569,7 +816,7 @@ func (m *model) currentFileCacheKey() string {
 		return ""
 	}
 
-	return "commit:" + commit.SHA
+	return "commit:" + commit.SHA + ws
 }
 
 func (m *model) currentDiffCacheKey() string {
@@ -587,8 +834,13 @@ func (m *model) currentDiffCacheKey() string {
 		path = file.Path
 	}
 
+	ws := ""
+	if m.ignoreWhitespace {
+		ws = ":ws"
+	}
+
 	if compare := m.activeComparison(); compare != nil {
-		return fmt.Sprintf("range:%s:%s:%s:%s:%d", compare.LeftRef, compare.DiffStyle, compare.RightRef, path, m.contextLines)
+		return fmt.Sprintf("range:%s:%s:%s:%s:%d%s", compare.LeftRef, compare.DiffStyle, compare.RightRef, path, m.contextLines, ws)
 	}
 
 	commit := m.selectedCommitValue()
@@ -596,7 +848,7 @@ func (m *model) currentDiffCacheKey() string {
 		return ""
 	}
 
-	return fmt.Sprintf("commit:%s:%s:%d", commit.SHA, path, m.contextLines)
+	return fmt.Sprintf("commit:%s:%s:%d%s", commit.SHA, path, m.contextLines, ws)
 }
 
 func (m *model) currentRenderCacheKey(width int) string {
@@ -616,6 +868,7 @@ func (m *model) renderDocument(width int) renderedDiff {
 
 	rendered := renderedDiff{
 		rows:     document.Rows,
+		rowMeta:  document.RowMeta,
 		hunkRows: document.HunkRows,
 	}
 	m.renderCache[cacheKey] = rendered
@@ -654,6 +907,9 @@ func (m *model) jumpToHunk(direction int, width int) {
 
 func (m *model) currentSelectionLabel() string {
 	if m.mode == domain.ModeConflict {
+		if m.ignoreWhitespace {
+			return "Conflict Mode [ignore ws]"
+		}
 		return "Conflict Mode"
 	}
 
@@ -662,9 +918,16 @@ func (m *model) currentSelectionLabel() string {
 		if compare.DiffStyle == domain.DiffThreeDot {
 			sep = "..."
 		}
-		return "Compare " + compare.LeftLabel + sep + compare.RightLabel
+		label := "Compare " + compare.LeftLabel + sep + compare.RightLabel
+		if m.ignoreWhitespace {
+			label += " [ignore ws]"
+		}
+		return label
 	}
 
+	if m.ignoreWhitespace {
+		return "History selected commit [ignore ws]"
+	}
 	return "History selected commit"
 }
 
@@ -711,7 +974,7 @@ func (m *model) refreshFiles() tea.Cmd {
 
 	m.loadingFiles = true
 	if compare := m.activeComparison(); compare != nil {
-		return loadRangeFilesCmd(m.repo.RootPath, *compare)
+		return loadRangeFilesCmdWithOptions(m.repo.RootPath, *compare, m.ignoreWhitespace)
 	}
 
 	commit := m.selectedCommitValue()
@@ -720,7 +983,7 @@ func (m *model) refreshFiles() tea.Cmd {
 		return nil
 	}
 
-	return tea.Batch(loadCommitFilesCmd(m.repo.RootPath, commit.SHA), m.prefetchNeighborFiles())
+	return tea.Batch(loadCommitFilesCmdWithOptions(m.repo.RootPath, commit.SHA, m.ignoreWhitespace), m.prefetchNeighborFiles())
 }
 
 func (m *model) refreshDiff() tea.Cmd {
@@ -746,7 +1009,7 @@ func (m *model) refreshDiff() tea.Cmd {
 		} else if cached, ok := m.diffCache[cacheKey]; ok {
 			m.loadingDiff = false
 			m.diff = cached
-			return nil
+			return m.maybeLoadBlame()
 		}
 	}
 
@@ -766,7 +1029,7 @@ func (m *model) refreshDiff() tea.Cmd {
 	}
 
 	if compare := m.activeComparison(); compare != nil {
-		return loadRangeDiffCmd(m.repo.RootPath, *compare, path, m.contextLines)
+		return tea.Batch(loadRangeDiffCmdWithOptions(m.repo.RootPath, *compare, path, m.contextLines, m.ignoreWhitespace), m.maybeLoadBlame())
 	}
 
 	commit := m.selectedCommitValue()
@@ -775,7 +1038,7 @@ func (m *model) refreshDiff() tea.Cmd {
 		return nil
 	}
 
-	return loadCommitDiffCmd(m.repo.RootPath, commit.SHA, path, m.contextLines)
+	return tea.Batch(loadCommitDiffCmdWithOptions(m.repo.RootPath, commit.SHA, path, m.contextLines, m.ignoreWhitespace), m.maybeLoadBlame())
 }
 
 func (m *model) prefetchNeighborFiles() tea.Cmd {
@@ -789,10 +1052,13 @@ func (m *model) prefetchNeighborFiles() tea.Cmd {
 			continue
 		}
 		key := "commit:" + m.commits[index].SHA
+		if m.ignoreWhitespace {
+			key += ":ws"
+		}
 		if _, ok := m.fileCache[key]; ok {
 			continue
 		}
-		cmds = append(cmds, prefetchCommitFilesCmd(m.repo.RootPath, m.commits[index].SHA))
+		cmds = append(cmds, prefetchCommitFilesCmdWithOptions(m.repo.RootPath, m.commits[index].SHA, m.ignoreWhitespace))
 	}
 
 	return tea.Batch(cmds...)
@@ -816,10 +1082,13 @@ func (m *model) prefetchNeighborDiffs() tea.Cmd {
 
 		if compare := m.activeComparison(); compare != nil {
 			key := fmt.Sprintf("range:%s:%s:%s:%s:%d", compare.LeftRef, compare.DiffStyle, compare.RightRef, path, m.contextLines)
+			if m.ignoreWhitespace {
+				key += ":ws"
+			}
 			if _, ok := m.diffCache[key]; ok {
 				continue
 			}
-			cmds = append(cmds, prefetchRangeDiffCmd(m.repo.RootPath, *compare, path, m.contextLines))
+			cmds = append(cmds, prefetchRangeDiffCmdWithOptions(m.repo.RootPath, *compare, path, m.contextLines, m.ignoreWhitespace))
 			continue
 		}
 
@@ -828,10 +1097,13 @@ func (m *model) prefetchNeighborDiffs() tea.Cmd {
 			continue
 		}
 		key := fmt.Sprintf("commit:%s:%s:%d", commit.SHA, path, m.contextLines)
+		if m.ignoreWhitespace {
+			key += ":ws"
+		}
 		if _, ok := m.diffCache[key]; ok {
 			continue
 		}
-		cmds = append(cmds, prefetchCommitDiffCmd(m.repo.RootPath, commit.SHA, path, m.contextLines))
+		cmds = append(cmds, prefetchCommitDiffCmdWithOptions(m.repo.RootPath, commit.SHA, path, m.contextLines, m.ignoreWhitespace))
 	}
 
 	return tea.Batch(cmds...)
@@ -843,6 +1115,7 @@ func (m *model) hardRefresh() tea.Cmd {
 	m.diffCache = map[string]string{}
 	m.conflictCache = map[string]domain.ConflictFileContents{}
 	m.renderCache = map[string]renderedDiff{}
+	m.blameCache = map[string]map[int]domain.BlameLine{}
 	return loadRepositoryCmd(m.cwd)
 }
 
@@ -883,6 +1156,7 @@ func (m *model) filteredPaletteCommands() []paletteCommand {
 		{id: "focus-files", label: "Focus files", description: "Move focus to the changed files pane"},
 		{id: "focus-diff", label: "Focus diff", description: "Move focus to the diff pane"},
 		{id: "compare-refs", label: "Compare arbitrary refs", description: "Choose any two branches, tags, or refs to compare"},
+		{id: "toggle-whitespace", label: "Toggle ignore whitespace", description: "Hide or show whitespace-only diff noise"},
 		{id: "toggle-layout", label: "Toggle diff layout", description: "Switch between inline and side-by-side diff rendering"},
 		{id: "context-up", label: "Increase context", description: "Show more unchanged lines around each hunk"},
 		{id: "context-down", label: "Decrease context", description: "Show fewer unchanged lines around each hunk"},
@@ -947,6 +1221,14 @@ func (m *model) executePaletteCommand(command paletteCommand) tea.Cmd {
 	case "compare-refs":
 		m.openRefPicker()
 		return nil
+	case "toggle-whitespace":
+		m.ignoreWhitespace = !m.ignoreWhitespace
+		if m.ignoreWhitespace {
+			m.actionMessage = "Ignoring whitespace changes."
+		} else {
+			m.actionMessage = "Showing whitespace changes."
+		}
+		return m.refreshFiles()
 	case "compare-file-commit":
 		m.openCommitPicker()
 		return nil
@@ -1085,6 +1367,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.diffCache[msg.key] = msg.diff
 		}
 		return m, nil
+	case blameLoadedMsg:
+		if msg.err == nil && msg.key != "" {
+			m.blameCache[msg.key] = msg.lines
+		}
+		return m, nil
 	case diffLoadedMsg:
 		m.loadingDiff = false
 		if msg.err != nil {
@@ -1114,6 +1401,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.actionMessage = msg.message
 		return m, m.hardRefresh()
 	case tea.KeyMsg:
+		if m.blameDetailOpen && msg.String() == "esc" {
+			m.blameDetailOpen = false
+			return m, nil
+		}
+
 		if m.commitPickerOpen {
 			switch msg.String() {
 			case "esc":
@@ -1244,6 +1536,31 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "b":
 			m.openRefPicker()
+			return m, nil
+		case "w":
+			m.ignoreWhitespace = !m.ignoreWhitespace
+			if m.ignoreWhitespace {
+				m.actionMessage = "Ignoring whitespace changes."
+			} else {
+				m.actionMessage = "Showing whitespace changes."
+			}
+			return m, m.refreshFiles()
+		case "B":
+			m.showBlame = !m.showBlame
+			m.blameDetailOpen = false
+			if m.showBlame {
+				m.actionMessage = "Inline blame on."
+				return m, m.maybeLoadBlame()
+			}
+			m.actionMessage = "Inline blame off."
+			return m, nil
+		case "K":
+			if !m.showBlame {
+				m.showBlame = true
+				m.blameDetailOpen = true
+				return m, m.maybeLoadBlame()
+			}
+			m.blameDetailOpen = !m.blameDetailOpen
 			return m, nil
 		case "enter":
 			if m.focus == focusFiles {
@@ -1417,6 +1734,12 @@ func (m *model) View() string {
 		contentHeight -= pickerHeight
 		commitPicker = m.renderCommitPicker(m.width-2, pickerHeight)
 	}
+	blameDetail := ""
+	if m.blameDetailOpen {
+		panelHeight := 7
+		contentHeight -= panelHeight
+		blameDetail = m.renderBlameDetail(m.width-2, panelHeight)
+	}
 	refPicker := ""
 	if m.refPickerOpen {
 		pickerHeight := 12
@@ -1448,6 +1771,9 @@ func (m *model) View() string {
 	if commitPicker != "" {
 		parts = append(parts, commitPicker)
 	}
+	if blameDetail != "" {
+		parts = append(parts, blameDetail)
+	}
 	if refPicker != "" {
 		parts = append(parts, refPicker)
 	}
@@ -1469,14 +1795,22 @@ func (m *model) currentDiffContentWidth() int {
 	if rightWidth < 40 {
 		rightWidth = 40
 	}
-	return maxInt(8, rightWidth-4)
+	return m.diffRenderWidth(maxInt(8, rightWidth-4))
+}
+
+func (m *model) blameColumnWidth(totalWidth int) int {
+	return 0
+}
+
+func (m *model) diffRenderWidth(totalWidth int) int {
+	return totalWidth
 }
 
 func (m *model) keyHelp() string {
 	if m.mode == domain.ModeConflict {
-		return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, : palette, b refs, i layout (%s), [ ] hunks, 1 ours, 2 theirs, r refresh, q quit", m.diffLayout)
+		return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, w whitespace, B blame, K blame detail, : palette, b refs, i layout (%s), [ ] hunks, 1 ours, 2 theirs, r refresh, q quit", m.diffLayout)
 	}
-	return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, enter file compare, : palette, b refs, i layout (%s), [ ] hunks, c compare, v anchor compare, g history, +/- context %d, o editor, r refresh, q quit", m.diffLayout, m.contextLines)
+	return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, enter file compare, w whitespace, B blame, K blame detail, : palette, b refs, i layout (%s), [ ] hunks, c compare, v anchor compare, g history, +/- context %d, o editor, r refresh, q quit", m.diffLayout, m.contextLines)
 }
 
 func (m *model) renderCommitsPane(width, height int) string {
@@ -1579,6 +1913,33 @@ func (m *model) renderCommitPicker(width, height int) string {
 	return lipgloss.NewStyle().
 		Border(lipgloss.DoubleBorder()).
 		BorderForeground(lipgloss.Color("10")).
+		Width(width).
+		Height(height).
+		Padding(0, 1).
+		Render(strings.Join(lines, "\n"))
+}
+
+func (m *model) renderBlameDetail(width, height int) string {
+	blame := m.currentVisibleBlame(width-2, maxInt(1, m.height-8))
+	lines := []string{
+		styleAccent.Render("Inline Blame"),
+	}
+
+	if blame == nil {
+		lines = append(lines, styleMuted.Render("No blamed diff line is visible right now. Scroll to a content line and press K again."))
+	} else {
+		lines = append(lines,
+			styleMuted.Render("Author: "+blame.AuthorName),
+			styleMuted.Render("Commit: "+blame.ShortSHA+"  Date: "+blame.AuthorTime),
+			styleMuted.Render("Line: "+fmt.Sprintf("%d", blame.Line)),
+			trimToWidth(blame.Summary, width-4),
+			styleMuted.Render("Esc closes."),
+		)
+	}
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color("8")).
 		Width(width).
 		Height(height).
 		Padding(0, 1).
@@ -1755,8 +2116,48 @@ func (m *model) renderDiffLines(width, height int) []string {
 		m.diffScroll = maxInt(0, len(document.rows)-1)
 	}
 
-	end := minInt(len(document.rows), m.diffScroll+height)
-	return document.rows[m.diffScroll:end]
+	if !m.showBlame {
+		end := minInt(len(document.rows), m.diffScroll+height)
+		return document.rows[m.diffScroll:end]
+	}
+
+	lines := make([]string, 0, height)
+	lastSummary := ""
+	hasLastSummary := false
+	if m.diffScroll > 0 {
+		for index := m.diffScroll - 1; index >= 0; index-- {
+			if index >= len(document.rowMeta) {
+				continue
+			}
+			if blame := m.blameLineForMeta(document.rowMeta[index]); blame != nil {
+				lastSummary = blameSummary(blame)
+				hasLastSummary = true
+				break
+			}
+		}
+	}
+
+	for index := m.diffScroll; index < len(document.rows) && len(lines) < height; index++ {
+		meta := render.RowMeta{}
+		if index < len(document.rowMeta) {
+			meta = document.rowMeta[index]
+		}
+
+		if blame := m.blameLineForMeta(meta); blame != nil {
+			summary := blameSummary(blame)
+			if summary != "" && (!hasLastSummary || summary != lastSummary) {
+				lines = append(lines, renderBlameSeparator(summary, width))
+				lastSummary = summary
+				hasLastSummary = true
+				if len(lines) >= height {
+					break
+				}
+			}
+		}
+		lines = append(lines, document.rows[index])
+	}
+
+	return lines
 }
 
 func (m *model) renderConflictContents(width int) []string {

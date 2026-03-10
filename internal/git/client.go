@@ -282,7 +282,17 @@ func parseNameStatusOutput(raw string) []domain.FileChange {
 }
 
 func ListCommitFiles(ctx context.Context, cwd, sha string) ([]domain.FileChange, error) {
-	raw, err := runGit(ctx, cwd, "show", "--no-ext-diff", "--format=", "--name-status", "--find-renames", sha)
+	return ListCommitFilesWithOptions(ctx, cwd, sha, false)
+}
+
+func ListCommitFilesWithOptions(ctx context.Context, cwd, sha string, ignoreWhitespace bool) ([]domain.FileChange, error) {
+	args := []string{"show", "--no-ext-diff", "--format=", "--name-status", "--find-renames"}
+	if ignoreWhitespace {
+		args = append(args, "-w")
+	}
+	args = append(args, sha)
+
+	raw, err := runGit(ctx, cwd, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +308,17 @@ func diffSpecifier(left, right string, style domain.DiffStyle) string {
 }
 
 func ListRangeFiles(ctx context.Context, cwd, left, right string, style domain.DiffStyle) ([]domain.FileChange, error) {
-	raw, err := runGit(ctx, cwd, "diff", "--no-ext-diff", "--name-status", "--find-renames", diffSpecifier(left, right, style))
+	return ListRangeFilesWithOptions(ctx, cwd, left, right, style, false)
+}
+
+func ListRangeFilesWithOptions(ctx context.Context, cwd, left, right string, style domain.DiffStyle, ignoreWhitespace bool) ([]domain.FileChange, error) {
+	args := []string{"diff", "--no-ext-diff", "--name-status", "--find-renames"}
+	if ignoreWhitespace {
+		args = append(args, "-w")
+	}
+	args = append(args, diffSpecifier(left, right, style))
+
+	raw, err := runGit(ctx, cwd, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +327,15 @@ func ListRangeFiles(ctx context.Context, cwd, left, right string, style domain.D
 }
 
 func GetCommitDiff(ctx context.Context, cwd, sha, path string, contextLines int) (string, error) {
-	args := []string{"show", "--no-ext-diff", fmt.Sprintf("--unified=%d", contextLines), "--format=", sha}
+	return GetCommitDiffWithOptions(ctx, cwd, sha, path, contextLines, false)
+}
+
+func GetCommitDiffWithOptions(ctx context.Context, cwd, sha, path string, contextLines int, ignoreWhitespace bool) (string, error) {
+	args := []string{"show", "--no-ext-diff", fmt.Sprintf("--unified=%d", contextLines), "--format="}
+	if ignoreWhitespace {
+		args = append(args, "-w")
+	}
+	args = append(args, sha)
 	if path != "" {
 		args = append(args, "--", path)
 	}
@@ -321,7 +349,15 @@ func GetCommitDiff(ctx context.Context, cwd, sha, path string, contextLines int)
 }
 
 func GetRangeDiff(ctx context.Context, cwd, left, right string, style domain.DiffStyle, path string, contextLines int) (string, error) {
-	args := []string{"diff", "--no-ext-diff", fmt.Sprintf("--unified=%d", contextLines), diffSpecifier(left, right, style)}
+	return GetRangeDiffWithOptions(ctx, cwd, left, right, style, path, contextLines, false)
+}
+
+func GetRangeDiffWithOptions(ctx context.Context, cwd, left, right string, style domain.DiffStyle, path string, contextLines int, ignoreWhitespace bool) (string, error) {
+	args := []string{"diff", "--no-ext-diff", fmt.Sprintf("--unified=%d", contextLines)}
+	if ignoreWhitespace {
+		args = append(args, "-w")
+	}
+	args = append(args, diffSpecifier(left, right, style))
 	if path != "" {
 		args = append(args, "--", path)
 	}
@@ -332,6 +368,74 @@ func GetRangeDiff(ctx context.Context, cwd, left, right string, style domain.Dif
 	}
 
 	return strings.TrimRight(raw, "\n"), nil
+}
+
+func GetBlame(ctx context.Context, cwd, revision, path string) (map[int]domain.BlameLine, error) {
+	args := []string{"blame", "--line-porcelain"}
+	if revision != "" {
+		args = append(args, revision)
+	}
+	args = append(args, "--", path)
+
+	raw, err := runGit(ctx, cwd, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(raw, "\n")
+	blame := map[int]domain.BlameLine{}
+	commitCache := map[string]domain.BlameLine{}
+
+	for index := 0; index < len(lines); {
+		line := lines[index]
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			index++
+			continue
+		}
+
+		sha := fields[0]
+		finalLine := 0
+		if _, err := fmt.Sscanf(fields[2], "%d", &finalLine); err != nil {
+			index++
+			continue
+		}
+
+		entry := commitCache[sha]
+		entry.CommitSHA = sha
+		if len(sha) >= 7 {
+			entry.ShortSHA = sha[:7]
+		} else {
+			entry.ShortSHA = sha
+		}
+		entry.Line = finalLine
+		index++
+
+		for index < len(lines) {
+			meta := lines[index]
+			if strings.HasPrefix(meta, "\t") {
+				index++
+				break
+			}
+			switch {
+			case strings.HasPrefix(meta, "author "):
+				entry.AuthorName = strings.TrimSpace(strings.TrimPrefix(meta, "author "))
+			case strings.HasPrefix(meta, "author-time "):
+				var unixSeconds int64
+				if _, err := fmt.Sscanf(strings.TrimPrefix(meta, "author-time "), "%d", &unixSeconds); err == nil {
+					entry.AuthorTime = time.Unix(unixSeconds, 0).Format("2006-01-02")
+				}
+			case strings.HasPrefix(meta, "summary "):
+				entry.Summary = strings.TrimSpace(strings.TrimPrefix(meta, "summary "))
+			}
+			index++
+		}
+
+		commitCache[sha] = entry
+		blame[finalLine] = entry
+	}
+
+	return blame, nil
 }
 
 func ListConflictFiles(ctx context.Context, cwd string) ([]domain.ConflictFile, error) {

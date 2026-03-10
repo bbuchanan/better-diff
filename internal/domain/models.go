@@ -58,6 +58,15 @@ type RefSummary struct {
 	Type     string
 }
 
+type BlameLine struct {
+	Line       int
+	CommitSHA  string
+	ShortSHA   string
+	AuthorName string
+	AuthorTime string
+	Summary    string
+}
+
 type ConflictFile struct {
 	Path      string
 	HasBase   bool
