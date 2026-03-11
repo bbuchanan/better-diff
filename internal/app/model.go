@@ -3487,19 +3487,21 @@ func (m *model) renderFilesPane(width, height int) string {
 	start, end := visibleListRange(len(m.files), m.selectedFile, height-2-len(lines))
 	for i := start; i < end; i++ {
 		file := m.files[i]
-		line := renderFileStatusBadge(file.Status) + " " + file.Path
-		if file.OldPath != "" {
-			line += " <- " + file.OldPath
-		}
-		line = trimToWidth(line, width-4)
-
+		selected := i == m.selectedFile
 		switch {
-		case i == m.selectedFile:
-			lines = append(lines, styleSelectedFile.Width(width-4).Render(line))
-		case file.Status == "U":
-			lines = append(lines, styleError.Render(line))
+		case selected:
+			lines = append(lines, renderSelectedFileLine(file, width-4))
 		default:
-			lines = append(lines, styleDefault.Render(line))
+			line := renderFileStatusBadge(file.Status, false) + " " + file.Path
+			if file.OldPath != "" {
+				line += " <- " + file.OldPath
+			}
+			line = trimToWidth(line, width-4)
+			if file.Status == "U" {
+				lines = append(lines, styleError.Render(line))
+			} else {
+				lines = append(lines, styleDefault.Render(line))
+			}
 		}
 	}
 
@@ -3845,7 +3847,7 @@ func renderInlineRefs(refs []string) string {
 	return "[" + strings.Join(parts, ", ") + "]"
 }
 
-func renderFileStatusBadge(status string) string {
+func renderFileStatusBadge(status string, selected bool) string {
 	label := " " + strings.TrimSpace(status) + " "
 	switch status {
 	case "A":
@@ -3859,6 +3861,14 @@ func renderFileStatusBadge(status string) string {
 	default:
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("24")).Bold(true).Render(label)
 	}
+}
+
+func renderSelectedFileLine(file domain.FileChange, width int) string {
+	line := strings.TrimSpace(file.Status) + " " + file.Path
+	if file.OldPath != "" {
+		line += " <- " + file.OldPath
+	}
+	return styleSelectedFile.Width(width).Render(trimToWidth(line, width))
 }
 
 func renderGraphLead(graph string, selected bool) string {
