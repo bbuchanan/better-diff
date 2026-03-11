@@ -119,6 +119,16 @@ type renderedDiff struct {
 	hunkRows []int
 }
 
+const (
+	maxFileCacheEntries     = 128
+	maxDiffCacheEntries     = 128
+	maxFullFileCacheEntries = 24
+	maxConflictCacheEntries = 24
+	maxRenderCacheEntries   = 48
+	maxBlameCacheEntries    = 48
+	maxParsedDiffEntries    = 96
+)
+
 type fullFileSpec struct {
 	leftRevision  string
 	rightRevision string
@@ -194,6 +204,8 @@ type model struct {
 	conflictCache map[string]domain.ConflictFileContents
 	renderCache   map[string]renderedDiff
 	blameCache    map[string]map[int]domain.BlameLine
+	parsedDiffs   map[string]render.Diff
+	blameLoading  map[string]struct{}
 }
 
 func NewModel(cwd string) tea.Model {
@@ -215,6 +227,8 @@ func NewModel(cwd string) tea.Model {
 		conflictCache:     map[string]domain.ConflictFileContents{},
 		renderCache:       map[string]renderedDiff{},
 		blameCache:        map[string]map[int]domain.BlameLine{},
+		parsedDiffs:       map[string]render.Diff{},
+		blameLoading:      map[string]struct{}{},
 	}
 }
 
@@ -1196,6 +1210,9 @@ func (m *model) maybeLoadBlame() tea.Cmd {
 	if !m.showBlame || m.repo == nil || m.mode == domain.ModeConflict {
 		return nil
 	}
+	if m.focus != focusDiff && !m.blameDetailOpen {
+		return nil
+	}
 
 	cmds := []tea.Cmd{}
 	for _, target := range m.currentBlameTargets() {
@@ -1203,6 +1220,10 @@ func (m *model) maybeLoadBlame() tea.Cmd {
 		if _, ok := m.blameCache[key]; ok {
 			continue
 		}
+		if _, ok := m.blameLoading[key]; ok {
+			continue
+		}
+		m.blameLoading[key] = struct{}{}
 		cmds = append(cmds, loadBlameCmd(m.repo.RootPath, target.revision, target.path))
 	}
 	return tea.Batch(cmds...)
@@ -1569,20 +1590,39 @@ func (m *model) currentRenderCacheKey(width int) string {
 	return fmt.Sprintf("%s:%s:%s:%d", baseKey, m.diffViewMode, m.diffLayout, width)
 }
 
+func clearMapWhenTooLarge[T any](items map[string]T, limit int) {
+	if len(items) > limit {
+		for key := range items {
+			delete(items, key)
+		}
+	}
+}
+
 func (m *model) renderDocument(width int) renderedDiff {
 	cacheKey := m.currentRenderCacheKey(width)
 	if cached, ok := m.renderCache[cacheKey]; ok {
 		return cached
 	}
 
-	document := render.BuildInlineDocument(m.diff, width)
+	document := render.Document{}
 	switch {
 	case m.mode == domain.ModeConflict && m.conflictContents != nil:
 		document = render.BuildConflictDocument(m.conflictContents.Path, m.conflictContents.Merged, width)
 	case m.diffViewMode == diffViewFullFile && m.fullFileCompare != nil:
 		document = render.BuildFullFileDocument(*m.fullFileCompare, width)
-	case m.diffLayout == diffLayoutSplit:
-		document = render.BuildSideBySideDocument(m.diff, width)
+	default:
+		parsedKey := m.currentDiffCacheKey()
+		parsed, ok := m.parsedDiffs[parsedKey]
+		if !ok {
+			parsed = render.ParseUnifiedDiff(m.diff)
+			m.parsedDiffs[parsedKey] = parsed
+			clearMapWhenTooLarge(m.parsedDiffs, maxParsedDiffEntries)
+		}
+		if m.diffLayout == diffLayoutSplit {
+			document = render.BuildSideBySideDocumentFromParsed(parsed, width)
+		} else {
+			document = render.BuildInlineDocumentFromParsed(parsed, width)
+		}
 	}
 
 	rendered := renderedDiff{
@@ -1591,6 +1631,7 @@ func (m *model) renderDocument(width int) renderedDiff {
 		hunkRows: document.HunkRows,
 	}
 	m.renderCache[cacheKey] = rendered
+	clearMapWhenTooLarge(m.renderCache, maxRenderCacheEntries)
 	return rendered
 }
 
@@ -1905,7 +1946,7 @@ func (m *model) prefetchNeighborFiles() tea.Cmd {
 }
 
 func (m *model) prefetchNeighborDiffs() tea.Cmd {
-	if m.repo == nil || m.mode == domain.ModeConflict || len(m.files) == 0 || m.diffViewMode == diffViewFullFile {
+	if m.repo == nil || m.mode == domain.ModeConflict || len(m.files) == 0 || len(m.files) > 80 || m.diffViewMode == diffViewFullFile {
 		return nil
 	}
 
@@ -1957,6 +1998,8 @@ func (m *model) hardRefresh() tea.Cmd {
 	m.conflictCache = map[string]domain.ConflictFileContents{}
 	m.renderCache = map[string]renderedDiff{}
 	m.blameCache = map[string]map[int]domain.BlameLine{}
+	m.parsedDiffs = map[string]render.Diff{}
+	m.blameLoading = map[string]struct{}{}
 	return loadRepositoryCmd(m.cwd)
 }
 
@@ -2365,6 +2408,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.fileCache[msg.key] = msg.files
+		clearMapWhenTooLarge(m.fileCache, maxFileCacheEntries)
 		if msg.key != m.currentFileCacheKey() {
 			return m, nil
 		}
@@ -2381,16 +2425,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case prefetchedFilesMsg:
 		if msg.key != "" && len(msg.files) >= 0 {
 			m.fileCache[msg.key] = msg.files
+			clearMapWhenTooLarge(m.fileCache, maxFileCacheEntries)
 		}
 		return m, nil
 	case prefetchedDiffMsg:
 		if msg.key != "" {
 			m.diffCache[msg.key] = msg.diff
+			clearMapWhenTooLarge(m.diffCache, maxDiffCacheEntries)
 		}
 		return m, nil
 	case blameLoadedMsg:
+		if msg.key != "" {
+			delete(m.blameLoading, msg.key)
+		}
 		if msg.err == nil && msg.key != "" {
 			m.blameCache[msg.key] = msg.lines
+			clearMapWhenTooLarge(m.blameCache, maxBlameCacheEntries)
 		}
 		return m, nil
 	case fullFileLoadedMsg:
@@ -2403,6 +2453,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.fullFileCache[msg.key] = *msg.compare
+		clearMapWhenTooLarge(m.fullFileCache, maxFullFileCacheEntries)
 		if msg.key == m.currentFullFileCacheKey() {
 			copy := *msg.compare
 			m.fullFileCompare = &copy
@@ -2418,6 +2469,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if msg.conflict != nil {
 			m.conflictCache[msg.key] = *msg.conflict
+			clearMapWhenTooLarge(m.conflictCache, maxConflictCacheEntries)
 			if msg.key == m.currentDiffCacheKey() {
 				copy := *msg.conflict
 				m.conflictContents = &copy
@@ -2426,6 +2478,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.diffCache[msg.key] = msg.diff
+		clearMapWhenTooLarge(m.diffCache, maxDiffCacheEntries)
+		if msg.key != "" && m.mode != domain.ModeConflict {
+			m.parsedDiffs[msg.key] = render.ParseUnifiedDiff(msg.diff)
+			clearMapWhenTooLarge(m.parsedDiffs, maxParsedDiffEntries)
+		}
 		if msg.key == m.currentDiffCacheKey() {
 			m.diff = msg.diff
 			m.diffLoaded = true
@@ -2652,6 +2709,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.maybeLoadBlame()
 			}
 			m.blameDetailOpen = !m.blameDetailOpen
+			if m.blameDetailOpen {
+				return m, m.maybeLoadBlame()
+			}
 			return m, nil
 		case "enter":
 			if m.mode == domain.ModeConflict && m.focus == focusDiff && m.repo != nil {
@@ -2675,6 +2735,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = focusCommits
 			case focusCommits:
 				m.focus = focusDiff
+				return m, m.maybeLoadBlame()
 			default:
 				m.focus = focusFiles
 			}
@@ -2687,6 +2748,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "l":
 			if m.focus == focusFiles || m.focus == focusCommits {
 				m.focus = focusDiff
+				return m, m.maybeLoadBlame()
 			}
 			return m, nil
 		case "H", "left":

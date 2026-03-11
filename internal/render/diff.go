@@ -241,6 +241,10 @@ func RenderInline(diffText string, width int) []string {
 
 func BuildInlineDocument(diffText string, width int) Document {
 	parsed := ParseUnifiedDiff(diffText)
+	return BuildInlineDocumentFromParsed(parsed, width)
+}
+
+func BuildInlineDocumentFromParsed(parsed Diff, width int) Document {
 	if len(parsed.Files) == 0 {
 		return Document{Rows: []string{styleFileMeta.Render("No diff loaded.")}, RowMeta: []RowMeta{{}}}
 	}
@@ -294,12 +298,16 @@ func RenderSideBySide(diffText string, width int) []string {
 
 func BuildSideBySideDocument(diffText string, width int) Document {
 	parsed := ParseUnifiedDiff(diffText)
+	return BuildSideBySideDocumentFromParsed(parsed, width)
+}
+
+func BuildSideBySideDocumentFromParsed(parsed Diff, width int) Document {
 	if len(parsed.Files) == 0 {
 		return Document{Rows: []string{styleFileMeta.Render("No diff loaded.")}, RowMeta: []RowMeta{{}}}
 	}
 
 	if width < 72 {
-		return BuildInlineDocument(diffText, width)
+		return BuildInlineDocumentFromParsed(parsed, width)
 	}
 
 	columnWidth := maxInt(28, (width-3)/2)

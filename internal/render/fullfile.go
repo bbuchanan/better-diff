@@ -187,7 +187,7 @@ func diffFullFileLines(leftLines, rightLines []string, ignoreWhitespace bool) []
 		return nil
 	}
 
-	if len(leftLines)*len(rightLines) > 4_000_000 {
+	if len(leftLines) > 2500 || len(rightLines) > 2500 || len(leftLines)*len(rightLines) > 500_000 {
 		return diffFullFileLinesFallback(leftLines, rightLines, ignoreWhitespace)
 	}
 
