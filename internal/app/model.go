@@ -32,8 +32,25 @@ const (
 type diffViewMode string
 
 const (
-	diffViewPatch    diffViewMode = "patch"
-	diffViewFullFile diffViewMode = "full"
+	diffViewPatch     diffViewMode = "patch"
+	diffViewFullFile  diffViewMode = "full"
+	helpOverlayHeight              = 14
+)
+
+type conflictSide string
+
+const (
+	conflictSideOurs   conflictSide = "ours"
+	conflictSideTheirs conflictSide = "theirs"
+)
+
+type localCompareMode string
+
+const (
+	localCompareNone     localCompareMode = ""
+	localCompareAll      localCompareMode = "all-local"
+	localCompareStaged   localCompareMode = "staged"
+	localCompareUnstaged localCompareMode = "unstaged"
 )
 
 type repoLoadedMsg struct {
@@ -90,6 +107,12 @@ type paletteCommand struct {
 	description string
 }
 
+type keyBinding struct {
+	section string
+	key     string
+	label   string
+}
+
 type renderedDiff struct {
 	rows     []string
 	rowMeta  []render.RowMeta
@@ -133,6 +156,9 @@ type model struct {
 	paletteOpen        bool
 	paletteQuery       string
 	paletteSelected    int
+	helpOpen           bool
+	helpScroll         int
+	conflictSideFocus  conflictSide
 	diffLayout         diffLayout
 	diffViewMode       diffViewMode
 	diffFullScreen     bool
@@ -172,22 +198,23 @@ type model struct {
 
 func NewModel(cwd string) tea.Model {
 	return &model{
-		cwd:              cwd,
-		mode:             domain.ModeHistory,
-		focus:            focusCommits,
-		contextLines:     3,
-		ignoreWhitespace: true,
-		presetDiffStyle:  domain.DiffThreeDot,
-		commitDiffStyle:  domain.DiffTwoDot,
-		diffLayout:       diffLayoutInline,
-		diffViewMode:     diffViewPatch,
-		showBlame:        true,
-		fileCache:        map[string][]domain.FileChange{},
-		diffCache:        map[string]string{},
-		fullFileCache:    map[string]render.FullFileCompare{},
-		conflictCache:    map[string]domain.ConflictFileContents{},
-		renderCache:      map[string]renderedDiff{},
-		blameCache:       map[string]map[int]domain.BlameLine{},
+		cwd:               cwd,
+		mode:              domain.ModeHistory,
+		focus:             focusFiles,
+		contextLines:      3,
+		ignoreWhitespace:  true,
+		presetDiffStyle:   domain.DiffThreeDot,
+		commitDiffStyle:   domain.DiffTwoDot,
+		conflictSideFocus: conflictSideOurs,
+		diffLayout:        diffLayoutInline,
+		diffViewMode:      diffViewPatch,
+		showBlame:         true,
+		fileCache:         map[string][]domain.FileChange{},
+		diffCache:         map[string]string{},
+		fullFileCache:     map[string]render.FullFileCompare{},
+		conflictCache:     map[string]domain.ConflictFileContents{},
+		renderCache:       map[string]renderedDiff{},
+		blameCache:        map[string]map[int]domain.BlameLine{},
 	}
 }
 
@@ -440,12 +467,74 @@ func applyConflictBlockCmd(root, path string, blockIndex int, resolution string)
 		ctx, cancel := gitadapter.Context(5 * time.Second)
 		defer cancel()
 
-		err := gitadapter.ApplyConflictBlockResolution(ctx, root, path, blockIndex, resolution)
+		result, err := gitadapter.ApplyConflictBlockResolution(ctx, root, path, blockIndex, resolution)
 		if err != nil {
 			return actionDoneMsg{err: err}
 		}
 
-		return actionDoneMsg{message: fmt.Sprintf("Applied %s to conflict %d in %s.", resolution, blockIndex+1, path)}
+		if result.Resolved {
+			return actionDoneMsg{message: fmt.Sprintf("Applied %s to conflict %d in %s. All conflicts resolved; file staged.", resolution, blockIndex+1, path)}
+		}
+
+		return actionDoneMsg{
+			message: fmt.Sprintf(
+				"Applied %s to conflict %d in %s. Warning: %d conflict(s) remain; file is not staged yet.",
+				resolution,
+				blockIndex+1,
+				path,
+				result.RemainingBlocks,
+			),
+		}
+	}
+}
+
+func revertHunkCmd(root, patch string, mode localCompareMode) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := gitadapter.Context(5 * time.Second)
+		defer cancel()
+
+		var err error
+		switch mode {
+		case localCompareStaged:
+			err = gitadapter.ApplyReversePatchCached(ctx, root, patch)
+		default:
+			err = gitadapter.ApplyReversePatch(ctx, root, patch)
+		}
+		if err != nil {
+			return actionDoneMsg{err: err}
+		}
+
+		switch mode {
+		case localCompareStaged:
+			return actionDoneMsg{message: "Reverted selected hunk from index."}
+		default:
+			return actionDoneMsg{message: "Reverted selected hunk from working tree."}
+		}
+	}
+}
+
+func revertFileCmd(root, revision, path string, mode localCompareMode) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := gitadapter.Context(5 * time.Second)
+		defer cancel()
+
+		var err error
+		switch mode {
+		case localCompareStaged:
+			err = gitadapter.RestoreIndexFile(ctx, root, revision, path)
+		default:
+			err = gitadapter.RestoreWorktreeFile(ctx, root, revision, path)
+		}
+		if err != nil {
+			return actionDoneMsg{err: err}
+		}
+
+		switch mode {
+		case localCompareStaged:
+			return actionDoneMsg{message: fmt.Sprintf("Reverted %s to %s in index.", path, revision)}
+		default:
+			return actionDoneMsg{message: fmt.Sprintf("Reverted %s to %s in working tree.", path, revision)}
+		}
 	}
 }
 
@@ -547,6 +636,33 @@ func (m *model) currentConflictBlock(width int) *conflicts.Block {
 	return nil
 }
 
+func (m *model) setConflictSide(side conflictSide) {
+	if side != conflictSideOurs && side != conflictSideTheirs {
+		return
+	}
+	m.conflictSideFocus = side
+}
+
+func (m *model) currentConflictSide(width int) conflictSide {
+	meta := m.currentDiffRowMeta(width)
+	if meta == nil {
+		return conflictSideOurs
+	}
+
+	switch {
+	case meta.OldLine > 0 && meta.NewLine <= 0:
+		return conflictSideOurs
+	case meta.NewLine > 0 && meta.OldLine <= 0:
+		return conflictSideTheirs
+	case m.conflictSideFocus == conflictSideTheirs && meta.NewLine > 0:
+		return conflictSideTheirs
+	case meta.OldLine > 0:
+		return conflictSideOurs
+	default:
+		return conflictSideTheirs
+	}
+}
+
 func (m *model) activeComparison() *domain.CompareSelection {
 	switch m.mode {
 	case domain.ModeComparePreset:
@@ -586,8 +702,144 @@ func (m *model) activeComparison() *domain.CompareSelection {
 	return nil
 }
 
+func (m *model) currentLocalCompareMode() localCompareMode {
+	compare := m.activeComparison()
+	if compare == nil {
+		return localCompareNone
+	}
+
+	switch {
+	case !strings.HasPrefix(compare.LeftRef, "__") && compare.RightRef == gitadapter.WorkingTreeRef:
+		return localCompareAll
+	case !strings.HasPrefix(compare.LeftRef, "__") && compare.RightRef == gitadapter.IndexRef:
+		return localCompareStaged
+	case compare.LeftRef == gitadapter.IndexRef && compare.RightRef == gitadapter.WorkingTreeRef:
+		return localCompareUnstaged
+	default:
+		return localCompareNone
+	}
+}
+
+func (m *model) editableLocalComparison() *domain.CompareSelection {
+	if m.mode == domain.ModeConflict || m.diffViewMode != diffViewPatch {
+		return nil
+	}
+	compare := m.activeComparison()
+	if compare == nil {
+		return nil
+	}
+	if mode := m.currentLocalCompareMode(); mode != localCompareStaged && mode != localCompareUnstaged {
+		return nil
+	}
+	file := m.selectedFileValue()
+	if file == nil || file.Path == "" || file.OldPath != "" {
+		return nil
+	}
+	return compare
+}
+
+func (m *model) startLocalCompare(mode localCompareMode) tea.Cmd {
+	if m.repo == nil || len(m.commits) == 0 {
+		return nil
+	}
+
+	if file := m.selectedFileValue(); file != nil {
+		m.preferredFilePath = file.Path
+	}
+	m.selectedCommit = 0
+	m.compareAnchor = ""
+	m.mode = domain.ModeCompareRefs
+
+	switch mode {
+	case localCompareAll:
+		m.customCompare = &domain.CompareSelection{
+			LeftRef:    "HEAD",
+			RightRef:   gitadapter.WorkingTreeRef,
+			LeftLabel:  "HEAD",
+			RightLabel: "Working Tree",
+			DiffStyle:  domain.DiffTwoDot,
+		}
+		m.actionMessage = "Comparing HEAD to Working Tree."
+	case localCompareStaged:
+		m.customCompare = &domain.CompareSelection{
+			LeftRef:    "HEAD",
+			RightRef:   gitadapter.IndexRef,
+			LeftLabel:  "HEAD",
+			RightLabel: "Index",
+			DiffStyle:  domain.DiffTwoDot,
+		}
+		m.actionMessage = "Comparing HEAD to Index (staged changes)."
+	case localCompareUnstaged:
+		m.customCompare = &domain.CompareSelection{
+			LeftRef:    gitadapter.IndexRef,
+			RightRef:   gitadapter.WorkingTreeRef,
+			LeftLabel:  "Index",
+			RightLabel: "Working Tree",
+			DiffStyle:  domain.DiffTwoDot,
+		}
+		m.actionMessage = "Comparing Index to Working Tree (unstaged changes)."
+	default:
+		return nil
+	}
+
+	return m.refreshFiles()
+}
+
+func buildHunkPatch(diffText string, hunkIndex int) string {
+	parsed := render.ParseUnifiedDiff(diffText)
+	if len(parsed.Files) == 0 {
+		return ""
+	}
+
+	file := parsed.Files[0]
+	if hunkIndex < 0 || hunkIndex >= len(file.Hunks) {
+		return ""
+	}
+
+	lines := append([]string{}, file.Headers...)
+	lines = append(lines, file.Hunks[hunkIndex].Header)
+	for _, line := range file.Hunks[hunkIndex].Lines {
+		lines = append(lines, line.Raw)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) currentEditableHunkPatch(width int) (string, int, bool) {
+	if m.editableLocalComparison() == nil || strings.TrimSpace(m.diff) == "" {
+		return "", -1, false
+	}
+
+	document := m.renderDocument(m.diffRenderWidth(width))
+	if len(document.hunkRows) == 0 {
+		return "", -1, false
+	}
+
+	hunkIndex := -1
+	for index, row := range document.hunkRows {
+		if row <= m.diffCursor {
+			hunkIndex = index
+			continue
+		}
+		break
+	}
+	if hunkIndex < 0 {
+		hunkIndex = 0
+	}
+
+	patch := buildHunkPatch(m.diff, hunkIndex)
+	if strings.TrimSpace(patch) == "" {
+		return "", -1, false
+	}
+	return patch, hunkIndex, true
+}
+
 func (m *model) availableRefs() []domain.RefSummary {
-	refs := make([]domain.RefSummary, 0, len(m.refs)+1)
+	refs := make([]domain.RefSummary, 0, len(m.refs)+2)
+	refs = append(refs, domain.RefSummary{
+		Name:     "Index",
+		FullName: gitadapter.IndexRef,
+		Type:     "workspace",
+	})
 	refs = append(refs, domain.RefSummary{
 		Name:     "Working Tree",
 		FullName: gitadapter.WorkingTreeRef,
@@ -630,6 +882,9 @@ func compareRefRevision(ref *domain.RefSummary) string {
 	}
 	if ref.FullName == gitadapter.WorkingTreeRef {
 		return gitadapter.WorkingTreeRef
+	}
+	if ref.FullName == gitadapter.IndexRef {
+		return gitadapter.IndexRef
 	}
 	return ref.Name
 }
@@ -724,7 +979,23 @@ func (m *model) filteredCommitPickerCommits() []domain.CommitSummary {
 		return nil
 	}
 
-	filtered := make([]domain.CommitSummary, 0, len(m.commits))
+	filtered := make([]domain.CommitSummary, 0, len(m.commits)+2)
+	workingTree := domain.CommitSummary{
+		SHA:      gitadapter.WorkingTreeRef,
+		ShortSHA: "WT",
+		Subject:  "Working Tree (uncommitted changes)",
+	}
+	if query == "" || strings.Contains(strings.ToLower(workingTree.ShortSHA+" "+workingTree.Subject), query) {
+		filtered = append(filtered, workingTree)
+	}
+	indexSnapshot := domain.CommitSummary{
+		SHA:      gitadapter.IndexRef,
+		ShortSHA: "IDX",
+		Subject:  "Index (staged snapshot)",
+	}
+	if query == "" || strings.Contains(strings.ToLower(indexSnapshot.ShortSHA+" "+indexSnapshot.Subject), query) {
+		filtered = append(filtered, indexSnapshot)
+	}
 
 	for _, commit := range m.commits[m.selectedCommit+1:] {
 		if query != "" {
@@ -766,6 +1037,25 @@ func (m *model) closeCommitPicker() {
 	m.commitPickerSelect = 0
 }
 
+func (m *model) exitTransientView() tea.Cmd {
+	if m.diffFullScreen {
+		m.diffFullScreen = false
+		m.actionMessage = "Exited fullscreen diff."
+		return nil
+	}
+	if m.mode == domain.ModeConflict {
+		return nil
+	}
+	if m.mode == domain.ModeComparePreset || m.mode == domain.ModeCompareCommits || m.mode == domain.ModeCompareRefs {
+		m.customCompare = nil
+		m.compareAnchor = ""
+		m.mode = domain.ModeHistory
+		m.actionMessage = "Returned to history mode."
+		return m.refreshFiles()
+	}
+	return nil
+}
+
 func (m *model) applySelectedCommitPicker() tea.Cmd {
 	selected := m.selectedCommitPickerValue()
 	file := m.selectedFileValue()
@@ -777,10 +1067,37 @@ func (m *model) applySelectedCommitPicker() tea.Cmd {
 	m.commitPickerOpen = false
 	m.commitPickerQuery = ""
 	m.commitPickerSelect = 0
+	m.preferredFilePath = file.Path
+	if selected.SHA == gitadapter.IndexRef {
+		m.compareAnchor = ""
+		m.customCompare = &domain.CompareSelection{
+			LeftRef:    current.SHA,
+			RightRef:   gitadapter.IndexRef,
+			LeftLabel:  current.ShortSHA,
+			RightLabel: "Index",
+			DiffStyle:  domain.DiffTwoDot,
+		}
+		m.mode = domain.ModeCompareRefs
+		m.actionMessage = fmt.Sprintf("Comparing %s between %s and Index", file.Path, current.ShortSHA)
+		return m.refreshFiles()
+	}
+	if selected.SHA == gitadapter.WorkingTreeRef {
+		m.compareAnchor = ""
+		m.customCompare = &domain.CompareSelection{
+			LeftRef:    current.SHA,
+			RightRef:   gitadapter.WorkingTreeRef,
+			LeftLabel:  current.ShortSHA,
+			RightLabel: "Working Tree",
+			DiffStyle:  domain.DiffTwoDot,
+		}
+		m.mode = domain.ModeCompareRefs
+		m.actionMessage = fmt.Sprintf("Comparing %s between %s and Working Tree", file.Path, current.ShortSHA)
+		return m.refreshFiles()
+	}
+
 	m.compareAnchor = selected.SHA
 	m.customCompare = nil
 	m.mode = domain.ModeCompareCommits
-	m.preferredFilePath = file.Path
 	m.actionMessage = fmt.Sprintf("Comparing %s between %s and %s", file.Path, selected.ShortSHA, current.ShortSHA)
 	return m.refreshFiles()
 }
@@ -977,6 +1294,14 @@ func (m *model) currentEditorLine(width int) int {
 	if meta == nil {
 		return 0
 	}
+	if m.mode == domain.ModeConflict {
+		switch m.currentConflictSide(width) {
+		case conflictSideOurs:
+			return meta.OldLine
+		case conflictSideTheirs:
+			return meta.NewLine
+		}
+	}
 	if meta.NewLine > 0 {
 		return meta.NewLine
 	}
@@ -993,7 +1318,20 @@ func (m *model) currentDiffStatus(width int) string {
 		if meta.Conflict {
 			parts = append(parts, fmt.Sprintf("conflict %d", meta.ConflictIndex+1))
 		}
-		parts = append(parts, "old "+formatLineNumber(meta.OldLine), "new "+formatLineNumber(meta.NewLine))
+		if meta.Conflict {
+			side := m.currentConflictSide(width)
+			parts = append(parts, "target "+string(side))
+			parts = append(parts, "ours "+formatLineNumber(meta.OldLine), "theirs "+formatLineNumber(meta.NewLine))
+			if block := m.currentConflictBlock(width); block != nil && len(block.Base) > 0 {
+				parts = append(parts, fmt.Sprintf("base %d line(s)", len(block.Base)))
+			}
+		} else {
+			line := meta.NewLine
+			if line <= 0 {
+				line = meta.OldLine
+			}
+			parts = append(parts, "merged "+formatLineNumber(line))
+		}
 		status := strings.Join(parts, "  |  ")
 		if width > 0 {
 			status = trimToWidth(status, width)
@@ -1031,6 +1369,23 @@ func (m *model) currentDiffStatus(width int) string {
 		status = trimToWidth(status, width)
 	}
 	return status
+}
+
+func (m *model) currentConflictInlineSummary(width int) string {
+	if m.mode != domain.ModeConflict {
+		return ""
+	}
+
+	block := m.currentConflictBlock(width)
+	if block == nil || len(block.Base) == 0 {
+		return ""
+	}
+
+	summary := fmt.Sprintf("Base available for conflict %d: %d line(s). Press K for detail.", block.Index+1, len(block.Base))
+	if width > 0 {
+		summary = trimToWidth(summary, width)
+	}
+	return summary
 }
 
 func (m *model) emptyDiffMessage() string {
@@ -1252,6 +1607,9 @@ func (m *model) currentDiffViewportHeight() int {
 	if m.commitPickerOpen {
 		contentHeight -= 12
 	}
+	if m.helpOpen {
+		contentHeight -= helpOverlayHeight
+	}
 	if m.blameDetailOpen {
 		contentHeight -= 7
 	}
@@ -1383,6 +1741,7 @@ func (m *model) refreshFiles() tea.Cmd {
 	m.diffScroll = 0
 	m.diffCursor = 0
 	m.conflictBaseOpen = false
+	m.conflictSideFocus = conflictSideOurs
 	m.selectedFile = 0
 
 	if m.mode == domain.ModeConflict {
@@ -1442,6 +1801,9 @@ func (m *model) refreshDiff() tea.Cmd {
 	m.diffScroll = 0
 	m.diffCursor = 0
 	m.conflictBaseOpen = false
+	if m.mode == domain.ModeConflict {
+		m.conflictSideFocus = conflictSideOurs
+	}
 
 	cacheKey := m.currentDiffCacheKey()
 	fullCacheKey := m.currentFullFileCacheKey()
@@ -1648,12 +2010,115 @@ func (m *model) diffViewLabel() string {
 	return string(m.diffLayout)
 }
 
+func (m *model) currentActionHints() []string {
+	hints := []string{"[tab] cycle", "[h/l] left diff", "[j/k] move", "[:] menu", "[?] keys"}
+	if m.mode == domain.ModeConflict {
+		hints = append(hints, "[[]/[]] conflicts", "[H/L] side", "[enter] apply", "[1/2/3] resolve", "[K] base", "[F] fullscreen")
+		return hints
+	}
+
+	hints = append(hints, "[[]/[]] hunks", "[A/S/W] local", "[b] refs", "[f] view", "[F] fullscreen")
+	if m.editableLocalComparison() != nil {
+		hints = append(hints, "[u/U] revert")
+	}
+	return hints
+}
+
+func (m *model) renderActionBar(width int) string {
+	if width <= 0 {
+		return ""
+	}
+	text := strings.Join(m.currentActionHints(), "  ")
+	return styleHeaderBar.Width(width).Render(trimToWidth(text, width))
+}
+
+func (m *model) currentKeyBindings() []keyBinding {
+	bindings := []keyBinding{
+		{section: "Global", key: "tab", label: "cycle files, commits, and diff focus"},
+		{section: "Global", key: "h l", label: "switch between the left stack and diff"},
+		{section: "Global", key: "j k", label: "move inside the focused pane or overlay"},
+		{section: "Global", key: ":", label: "open the action menu"},
+		{section: "Global", key: "?", label: "open keyboard help"},
+		{section: "Global", key: "esc", label: "close overlays, exit fullscreen, or leave compare mode"},
+		{section: "Global", key: "r", label: "refresh repository state"},
+		{section: "Global", key: "q", label: "quit"},
+	}
+
+	if m.mode == domain.ModeConflict {
+		bindings = append(bindings,
+			keyBinding{section: "Conflict", key: "[ ]", label: "jump between conflict blocks"},
+			keyBinding{section: "Conflict", key: "H L", label: "target ours vs theirs for status and editor jumps"},
+			keyBinding{section: "Conflict", key: "enter", label: "apply the currently targeted side to the selected block"},
+			keyBinding{section: "Conflict", key: "K", label: "show base detail for the selected conflict"},
+			keyBinding{section: "Conflict", key: "1", label: "accept ours for the selected block"},
+			keyBinding{section: "Conflict", key: "2", label: "accept theirs for the selected block"},
+			keyBinding{section: "Conflict", key: "3", label: "accept both sides for the selected block"},
+			keyBinding{section: "Conflict", key: "O", label: "accept the whole file as ours"},
+			keyBinding{section: "Conflict", key: "T", label: "accept the whole file as theirs"},
+			keyBinding{section: "Conflict", key: "o", label: "open the selected file at the current line in the editor"},
+			keyBinding{section: "View", key: "F", label: "toggle diff fullscreen"},
+		)
+		return bindings
+	}
+
+	bindings = append(bindings,
+		keyBinding{section: "Review", key: "enter", label: "compare the selected file against Working Tree or another commit"},
+		keyBinding{section: "Review", key: "[ ]", label: "jump between hunks or change blocks"},
+		keyBinding{section: "Review", key: "B", label: "toggle inline blame"},
+		keyBinding{section: "Review", key: "K", label: "show blame detail for the selected line"},
+		keyBinding{section: "Review", key: "w", label: "toggle whitespace-ignore"},
+		keyBinding{section: "Review", key: "+ -", label: "change hunk context"},
+		keyBinding{section: "Review", key: "o", label: "open the selected file at the current line in the editor"},
+		keyBinding{section: "Compare", key: "b", label: "compare arbitrary refs"},
+		keyBinding{section: "Compare", key: "A", label: "compare HEAD to Working Tree (all local changes)"},
+		keyBinding{section: "Compare", key: "S", label: "compare HEAD to Index (staged changes)"},
+		keyBinding{section: "Compare", key: "W", label: "compare Index to Working Tree (unstaged changes)"},
+		keyBinding{section: "Compare", key: "c", label: "toggle base vs HEAD compare"},
+		keyBinding{section: "Compare", key: "v", label: "anchor the selected commit for compare"},
+		keyBinding{section: "Compare", key: "g", label: "return to history mode"},
+		keyBinding{section: "View", key: "i", label: "toggle inline vs side-by-side patch view"},
+		keyBinding{section: "View", key: "f", label: "toggle patch vs full-file view"},
+		keyBinding{section: "View", key: "F", label: "toggle diff fullscreen"},
+	)
+
+	if m.editableLocalComparison() != nil {
+		bindings = append(bindings,
+			keyBinding{section: "Working Tree", key: "u", label: "revert the selected hunk"},
+			keyBinding{section: "Working Tree", key: "U", label: "revert the selected file"},
+		)
+	}
+
+	return bindings
+}
+
+func (m *model) helpLineCount() int {
+	count := 3
+	currentSection := ""
+	for _, binding := range m.currentKeyBindings() {
+		if binding.section != currentSection {
+			currentSection = binding.section
+			count++
+		}
+		count++
+	}
+	return count
+}
+
+func (m *model) maxHelpScroll(height int) int {
+	visibleHeight := maxInt(1, height-2)
+	return maxInt(0, m.helpLineCount()-visibleHeight)
+}
+
 func (m *model) filteredPaletteCommands() []paletteCommand {
 	commands := []paletteCommand{
+		{id: "show-help", label: "Show keyboard help", description: "Open the full keyboard reference overlay"},
 		{id: "refresh", label: "Refresh repo", description: "Reload commits, files, conflicts, and caches"},
 		{id: "focus-commits", label: "Focus commits", description: "Move focus to the commit graph pane"},
 		{id: "focus-files", label: "Focus files", description: "Move focus to the changed files pane"},
 		{id: "focus-diff", label: "Focus diff", description: "Move focus to the diff pane"},
+		{id: "compare-all-local", label: "Compare HEAD to Working Tree", description: "Review all local changes including staged, unstaged, and untracked"},
+		{id: "compare-staged", label: "Compare HEAD to Index", description: "Review only staged changes as they would be committed now"},
+		{id: "compare-unstaged", label: "Compare Index to Working Tree", description: "Review only unstaged and untracked local changes"},
 		{id: "compare-refs", label: "Compare arbitrary refs", description: "Choose any two branches, tags, or refs to compare"},
 		{id: "toggle-whitespace", label: "Toggle ignore whitespace", description: "Hide or show whitespace-only diff noise"},
 		{id: "toggle-layout", label: "Toggle diff layout", description: "Switch between inline and side-by-side diff rendering"},
@@ -1689,6 +2154,20 @@ func (m *model) filteredPaletteCommands() []paletteCommand {
 			description: "Open the selected file in $VISUAL, $EDITOR, or VS Code",
 		})
 	}
+	if m.editableLocalComparison() != nil {
+		commands = append(commands,
+			paletteCommand{
+				id:          "revert-hunk",
+				label:       "Revert selected hunk",
+				description: "Apply the left side of the current patch hunk back to the working tree",
+			},
+			paletteCommand{
+				id:          "revert-file",
+				label:       "Revert selected file",
+				description: "Restore the selected file in the working tree from the left side of the comparison",
+			},
+		)
+	}
 
 	query := strings.ToLower(strings.TrimSpace(m.paletteQuery))
 	if query == "" {
@@ -1708,6 +2187,10 @@ func (m *model) filteredPaletteCommands() []paletteCommand {
 
 func (m *model) executePaletteCommand(command paletteCommand) tea.Cmd {
 	switch command.id {
+	case "show-help":
+		m.helpOpen = true
+		m.helpScroll = 0
+		return nil
 	case "refresh":
 		return m.hardRefresh()
 	case "focus-commits":
@@ -1719,6 +2202,12 @@ func (m *model) executePaletteCommand(command paletteCommand) tea.Cmd {
 	case "focus-diff":
 		m.focus = focusDiff
 		return nil
+	case "compare-all-local":
+		return m.startLocalCompare(localCompareAll)
+	case "compare-staged":
+		return m.startLocalCompare(localCompareStaged)
+	case "compare-unstaged":
+		return m.startLocalCompare(localCompareUnstaged)
 	case "compare-refs":
 		m.openRefPicker()
 		return nil
@@ -1813,6 +2302,31 @@ func (m *model) executePaletteCommand(command paletteCommand) tea.Cmd {
 		return nil
 	case "open-editor":
 		return m.openSelectedFileInEditor()
+	case "revert-hunk":
+		if m.repo == nil {
+			m.actionMessage = "No repository loaded."
+			return nil
+		}
+		patch, hunkIndex, ok := m.currentEditableHunkPatch(m.currentDiffContentWidth())
+		if !ok {
+			m.actionMessage = "No editable hunk is selected."
+			return nil
+		}
+		m.actionMessage = fmt.Sprintf("Reverting hunk %d from working tree...", hunkIndex+1)
+		return revertHunkCmd(m.repo.RootPath, patch, m.currentLocalCompareMode())
+	case "revert-file":
+		if m.repo == nil {
+			m.actionMessage = "No repository loaded."
+			return nil
+		}
+		compare := m.editableLocalComparison()
+		file := m.selectedFileValue()
+		if compare == nil || file == nil {
+			m.actionMessage = "Selected file is not editable in this view."
+			return nil
+		}
+		m.actionMessage = fmt.Sprintf("Reverting %s from working tree...", file.Path)
+		return revertFileCmd(m.repo.RootPath, compare.LeftRef, file.Path, m.currentLocalCompareMode())
 	}
 
 	return nil
@@ -1928,6 +2442,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.blameDetailOpen && msg.String() == "esc" {
 			m.blameDetailOpen = false
 			return m, nil
+		}
+		if m.helpOpen {
+			switch msg.String() {
+			case "esc", "?":
+				m.helpOpen = false
+				m.helpScroll = 0
+				return m, nil
+			case "up", "ctrl+p", "k":
+				m.helpScroll = maxInt(0, m.helpScroll-1)
+				return m, nil
+			case "down", "ctrl+n", "j":
+				m.helpScroll = minInt(m.maxHelpScroll(helpOverlayHeight), m.helpScroll+1)
+				return m, nil
+			default:
+				return m, nil
+			}
 		}
 		if m.conflictBaseOpen && msg.String() == "esc" {
 			m.conflictBaseOpen = false
@@ -2057,14 +2587,43 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "q":
 			return m, tea.Quit
+		case "?":
+			m.helpOpen = true
+			m.helpScroll = 0
+			m.paletteOpen = false
+			m.paletteQuery = ""
+			m.paletteSelected = 0
+			return m, nil
 		case ":":
 			m.paletteOpen = true
 			m.paletteQuery = ""
 			m.paletteSelected = 0
+			m.helpOpen = false
+			m.helpScroll = 0
+			return m, nil
+		case "esc":
+			if cmd := m.exitTransientView(); cmd != nil {
+				return m, cmd
+			}
 			return m, nil
 		case "b":
 			m.openRefPicker()
 			return m, nil
+		case "A":
+			if m.mode == domain.ModeConflict {
+				return m, nil
+			}
+			return m, m.startLocalCompare(localCompareAll)
+		case "S":
+			if m.mode == domain.ModeConflict {
+				return m, nil
+			}
+			return m, m.startLocalCompare(localCompareStaged)
+		case "W":
+			if m.mode == domain.ModeConflict {
+				return m, nil
+			}
+			return m, m.startLocalCompare(localCompareUnstaged)
 		case "w":
 			m.ignoreWhitespace = !m.ignoreWhitespace
 			if m.ignoreWhitespace {
@@ -2095,22 +2654,53 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.blameDetailOpen = !m.blameDetailOpen
 			return m, nil
 		case "enter":
+			if m.mode == domain.ModeConflict && m.focus == focusDiff && m.repo != nil {
+				conflict := m.selectedConflictValue()
+				if conflict != nil {
+					if blockIndex := m.currentConflictBlockIndex(m.currentDiffContentWidth()); blockIndex >= 0 {
+						side := m.currentConflictSide(m.currentDiffContentWidth())
+						m.actionMessage = fmt.Sprintf("Applying %s to conflict %d...", side, blockIndex+1)
+						return m, applyConflictBlockCmd(m.repo.RootPath, conflict.Path, blockIndex, string(side))
+					}
+				}
+			}
 			if m.focus == focusFiles {
 				m.openCommitPicker()
 				return m, nil
 			}
 			return m, nil
 		case "tab":
-			m.focus = paneFocus((int(m.focus) + 1) % 3)
+			switch m.focus {
+			case focusFiles:
+				m.focus = focusCommits
+			case focusCommits:
+				m.focus = focusDiff
+			default:
+				m.focus = focusFiles
+			}
 			return m, nil
 		case "h":
-			if m.focus > focusCommits {
-				m.focus--
+			if m.focus == focusDiff {
+				m.focus = focusFiles
 			}
 			return m, nil
 		case "l":
-			if m.focus < focusDiff {
-				m.focus++
+			if m.focus == focusFiles || m.focus == focusCommits {
+				m.focus = focusDiff
+			}
+			return m, nil
+		case "H", "left":
+			if m.mode == domain.ModeConflict && m.focus == focusDiff {
+				m.setConflictSide(conflictSideOurs)
+				m.actionMessage = "Conflict target: ours."
+				return m, nil
+			}
+			return m, nil
+		case "L", "right":
+			if m.mode == domain.ModeConflict && m.focus == focusDiff {
+				m.setConflictSide(conflictSideTheirs)
+				m.actionMessage = "Conflict target: theirs."
+				return m, nil
 			}
 			return m, nil
 		case "j", "down":
@@ -2262,6 +2852,47 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "r":
 			return m, m.hardRefresh()
+		case "u":
+			if m.mode == domain.ModeConflict {
+				return m, nil
+			}
+			if m.repo == nil {
+				m.actionMessage = "No repository loaded."
+				return m, nil
+			}
+			patch, hunkIndex, ok := m.currentEditableHunkPatch(m.currentDiffContentWidth())
+			if !ok {
+				m.actionMessage = "Hunk revert is only available in staged or unstaged local patch views."
+				return m, nil
+			}
+			switch m.currentLocalCompareMode() {
+			case localCompareStaged:
+				m.actionMessage = fmt.Sprintf("Reverting hunk %d from index...", hunkIndex+1)
+			default:
+				m.actionMessage = fmt.Sprintf("Reverting hunk %d from working tree...", hunkIndex+1)
+			}
+			return m, revertHunkCmd(m.repo.RootPath, patch, m.currentLocalCompareMode())
+		case "U":
+			if m.mode == domain.ModeConflict {
+				return m, nil
+			}
+			if m.repo == nil {
+				m.actionMessage = "No repository loaded."
+				return m, nil
+			}
+			compare := m.editableLocalComparison()
+			file := m.selectedFileValue()
+			if compare == nil || file == nil {
+				m.actionMessage = "File revert is only available in staged or unstaged local patch views."
+				return m, nil
+			}
+			switch m.currentLocalCompareMode() {
+			case localCompareStaged:
+				m.actionMessage = fmt.Sprintf("Reverting %s from index...", file.Path)
+			default:
+				m.actionMessage = fmt.Sprintf("Reverting %s from working tree...", file.Path)
+			}
+			return m, revertFileCmd(m.repo.RootPath, compare.LeftRef, file.Path, m.currentLocalCompareMode())
 		case "+":
 			if m.contextLines < 20 {
 				m.contextLines++
@@ -2289,7 +2920,8 @@ func (m *model) View() string {
 		styleTitle.Render("Better Diff (Go/Bubble Tea)"),
 		styleMuted.Render("Repo: " + m.currentRepoLabel()),
 		styleMode.Render("Mode: " + m.currentSelectionLabel()),
-		styleMuted.Render(m.keyHelp()),
+		m.renderActionBar(m.width - 2),
+		styleMuted.Render("Press ? for all keys and : for the action menu."),
 	}
 
 	if m.actionMessage != "" {
@@ -2313,6 +2945,12 @@ func (m *model) View() string {
 		pickerHeight := 12
 		contentHeight -= pickerHeight
 		commitPicker = m.renderCommitPicker(m.width-2, pickerHeight)
+	}
+	helpOverlay := ""
+	if m.helpOpen {
+		panelHeight := helpOverlayHeight
+		contentHeight -= panelHeight
+		helpOverlay = m.renderHelpOverlay(m.width-2, panelHeight)
 	}
 	blameDetail := ""
 	if m.blameDetailOpen {
@@ -2340,17 +2978,27 @@ func (m *model) View() string {
 	if m.diffFullScreen {
 		panes = m.renderDiffPane(maxInt(40, m.width-2), contentHeight)
 	} else {
-		leftWidth := clampInt(m.width/3, 28, 42)
-		midWidth := clampInt(m.width/4, 24, 34)
-		rightWidth := m.width - leftWidth - midWidth - 6
+		leftWidth := clampInt(m.width/3, 30, 42)
+		rightWidth := m.width - leftWidth - 4
 		if rightWidth < 40 {
 			rightWidth = 40
 		}
+		filesHeight := clampInt(contentHeight/3, 8, maxInt(8, contentHeight-10))
+		commitsHeight := contentHeight - filesHeight - 1
+		if commitsHeight < 8 {
+			commitsHeight = 8
+			filesHeight = maxInt(8, contentHeight-commitsHeight-1)
+		}
+
+		leftColumn := lipgloss.JoinVertical(
+			lipgloss.Left,
+			m.renderFilesPane(leftWidth, filesHeight),
+			m.renderCommitsPane(leftWidth, commitsHeight),
+		)
 
 		panes = lipgloss.JoinHorizontal(
 			lipgloss.Top,
-			m.renderCommitsPane(leftWidth, contentHeight),
-			m.renderFilesPane(midWidth, contentHeight),
+			leftColumn,
 			m.renderDiffPane(rightWidth, contentHeight),
 		)
 	}
@@ -2361,6 +3009,9 @@ func (m *model) View() string {
 	}
 	if commitPicker != "" {
 		parts = append(parts, commitPicker)
+	}
+	if helpOverlay != "" {
+		parts = append(parts, helpOverlay)
 	}
 	if blameDetail != "" {
 		parts = append(parts, blameDetail)
@@ -2386,9 +3037,8 @@ func (m *model) currentDiffContentWidth() int {
 	if m.diffFullScreen {
 		return m.diffRenderWidth(maxInt(8, m.width-6))
 	}
-	leftWidth := clampInt(m.width/3, 28, 42)
-	midWidth := clampInt(m.width/4, 24, 34)
-	rightWidth := m.width - leftWidth - midWidth - 6
+	leftWidth := clampInt(m.width/3, 30, 42)
+	rightWidth := m.width - leftWidth - 4
 	if rightWidth < 40 {
 		rightWidth = 40
 	}
@@ -2401,13 +3051,6 @@ func (m *model) blameColumnWidth(totalWidth int) int {
 
 func (m *model) diffRenderWidth(totalWidth int) int {
 	return totalWidth
-}
-
-func (m *model) keyHelp() string {
-	if m.mode == domain.ModeConflict {
-		return "Keys: tab/h/l switch panes, j/k move in focused pane, : palette, F fullscreen, [ ] conflicts, K base detail, 1 ours block, 2 theirs block, 3 both block, O whole ours, T whole theirs, o editor line, r refresh, q quit"
-	}
-	return fmt.Sprintf("Keys: tab/h/l switch panes, j/k move in focused pane, enter file compare, w whitespace, B blame, K blame detail, : palette, b refs, i layout (%s), f view (%s), F fullscreen, [ ] hunks, c compare, v anchor compare, g history, +/- context %d, o editor line, r refresh, q quit", m.diffLayout, m.diffViewMode, m.contextLines)
 }
 
 func (m *model) renderCommitsPane(width, height int) string {
@@ -2442,8 +3085,8 @@ func (m *model) renderCommitsPane(width, height int) string {
 func (m *model) renderPalette(width, height int) string {
 	commands := m.filteredPaletteCommands()
 	lines := []string{
-		styleAccent.Render("Command Palette"),
-		styleMuted.Render("Type to filter. Enter runs. Esc closes."),
+		styleAccent.Render("Action Menu"),
+		styleMuted.Render("Type to filter. Enter runs. Esc closes. Use ? for the full keyboard map."),
 		styleMuted.Render("Query: " + m.paletteQuery),
 		"",
 	}
@@ -2470,6 +3113,36 @@ func (m *model) renderPalette(width, height int) string {
 		Render(strings.Join(lines, "\n"))
 }
 
+func (m *model) renderHelpOverlay(width, height int) string {
+	lines := []string{
+		styleAccent.Render("Keyboard Help"),
+		styleMuted.Render("j/k scroll. Esc or ? closes."),
+		"",
+	}
+
+	currentSection := ""
+	for _, binding := range m.currentKeyBindings() {
+		if binding.section != currentSection {
+			currentSection = binding.section
+			lines = append(lines, styleSection.Render(currentSection))
+		}
+		line := fmt.Sprintf("%-10s %s", binding.key, binding.label)
+		lines = append(lines, trimToWidth(line, width-4))
+	}
+
+	visibleHeight := maxInt(1, height-2)
+	start := clampInt(m.helpScroll, 0, maxInt(0, len(lines)-visibleHeight))
+	end := minInt(len(lines), start+visibleHeight)
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color("13")).
+		Width(width).
+		Height(height).
+		Padding(0, 1).
+		Render(strings.Join(lines[start:end], "\n"))
+}
+
 func (m *model) renderCommitPicker(width, height int) string {
 	file := m.selectedFileValue()
 	current := m.selectedCommitValue()
@@ -2483,8 +3156,8 @@ func (m *model) renderCommitPicker(width, height int) string {
 	}
 
 	lines := []string{
-		styleAccent.Render("Compare File To Commit"),
-		styleMuted.Render("Pick the other commit for the selected file. Type to filter. Enter selects. Esc closes."),
+		styleAccent.Render("Compare File To..."),
+		styleMuted.Render("Pick Working Tree, Index, or another commit for the selected file. Type to filter. Enter selects. Esc closes."),
 		styleMuted.Render("File: " + trimToWidth(target, width-10)),
 		styleMuted.Render("Current: " + trimToWidth(currentLabel, width-13)),
 		styleMuted.Render("Query: " + m.commitPickerQuery),
@@ -2690,6 +3363,9 @@ func (m *model) renderDiffPane(width, height int) string {
 	if status != "" {
 		lines = append(lines, styleCursorInfo.Width(width-4).Render(status))
 	}
+	if summary := m.currentConflictInlineSummary(width - 4); summary != "" {
+		lines = append(lines, styleMuted.Width(width-4).Render(summary))
+	}
 	lines = append(lines, m.renderDiffLines(width-4, maxInt(1, height-3-len(lines)))...)
 
 	if file := m.selectedFileValue(); file != nil {
@@ -2873,6 +3549,7 @@ var (
 	styleMode           = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	styleMuted          = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	styleAccent         = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
+	styleHeaderBar      = lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Background(lipgloss.Color("236")).Padding(0, 1)
 	styleSection        = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
 	styleAdd            = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
 	styleDel            = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))

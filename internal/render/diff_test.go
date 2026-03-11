@@ -207,6 +207,28 @@ func alpha() int {
 	if !foundConflict {
 		t.Fatal("expected conflict row metadata")
 	}
+	if strings.Contains(rendered, "base hidden") {
+		t.Fatalf("expected conflict renderer to omit repeated base-hidden row, got %q", rendered)
+	}
+
+	var firstConflictLine RowMeta
+	foundFirstConflictLine := false
+	for _, meta := range document.RowMeta {
+		if meta.Conflict && meta.Kind == LineAdd {
+			firstConflictLine = meta
+			foundFirstConflictLine = true
+			break
+		}
+	}
+	if !foundFirstConflictLine {
+		t.Fatal("expected a conflict content row")
+	}
+	if got, want := firstConflictLine.OldLine, 4; got != want {
+		t.Fatalf("first conflict old line = %d, want %d", got, want)
+	}
+	if got, want := firstConflictLine.NewLine, 7; got != want {
+		t.Fatalf("first conflict new line = %d, want %d", got, want)
+	}
 }
 
 func TestChangedSpan(t *testing.T) {

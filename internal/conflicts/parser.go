@@ -20,6 +20,16 @@ type Block struct {
 	Theirs          []string
 }
 
+func CountBlocks(parsed Parsed) int {
+	count := 0
+	for _, segment := range parsed.Segments {
+		if segment.Block != nil {
+			count++
+		}
+	}
+	return count
+}
+
 func Parse(content string) Parsed {
 	content = strings.ReplaceAll(content, "\r", "")
 	hasTrailingNewline := strings.HasSuffix(content, "\n")
