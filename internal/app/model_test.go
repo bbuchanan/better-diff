@@ -257,6 +257,43 @@ gamma
 	}
 }
 
+func TestConflictResultLinesShowMergedContext(t *testing.T) {
+	m := &model{
+		mode:   domain.ModeConflict,
+		width:  120,
+		height: 40,
+		conflictContents: &domain.ConflictFileContents{
+			Path: "demo.txt",
+			Merged: `prefix
+<<<<<<< ours
+alpha
+=======
+gamma
+>>>>>>> theirs
+suffix
+`,
+		},
+		renderCache: map[string]renderedDiff{},
+	}
+
+	document := render.BuildConflictDocument("demo.txt", m.conflictContents.Merged, 80)
+	m.renderCache[m.currentRenderCacheKey(m.currentDiffContentWidth())] = renderedDiff{
+		rows:     document.Rows,
+		rowMeta:  document.RowMeta,
+		hunkRows: document.HunkRows,
+	}
+	m.diffCursor = 3
+
+	lines := m.currentConflictResultLines(80, 8)
+	rendered := strings.Join(lines, "\n")
+	if !strings.Contains(rendered, "prefix") || !strings.Contains(rendered, "suffix") {
+		t.Fatalf("expected merged context in result preview, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "<<<<<<< ours") {
+		t.Fatalf("expected unresolved markers in live merge result, got %q", rendered)
+	}
+}
+
 func TestEscapeLeavesCompareMode(t *testing.T) {
 	m := &model{
 		repo: &domain.RepositoryInfo{RootPath: "/tmp/repo"},
@@ -283,6 +320,30 @@ func TestEscapeLeavesCompareMode(t *testing.T) {
 	}
 	if m.customCompare != nil {
 		t.Fatalf("expected custom compare to be cleared, got %+v", m.customCompare)
+	}
+}
+
+func TestCommitEnterAnchorsCompare(t *testing.T) {
+	m := &model{
+		repo:  &domain.RepositoryInfo{RootPath: "/tmp/repo"},
+		mode:  domain.ModeHistory,
+		focus: focusCommits,
+		commits: []domain.CommitSummary{
+			{SHA: "head-sha", ShortSHA: "head", Subject: "current"},
+			{SHA: "older-sha", ShortSHA: "old", Subject: "older"},
+		},
+	}
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(*model)
+	if cmd == nil {
+		t.Fatal("expected enter on commit to refresh compare state")
+	}
+	if got, want := m.compareAnchor, "head-sha"; got != want {
+		t.Fatalf("compareAnchor = %q, want %q", got, want)
+	}
+	if got, want := m.mode, domain.ModeCompareCommits; got != want {
+		t.Fatalf("mode = %q, want %q", got, want)
 	}
 }
 

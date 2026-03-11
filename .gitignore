@@ -1,4 +1,5 @@
 .tmp-smoke-repo
 .tmp-conflict-repo
 bin/
+dist/
 better-diff

@@ -1116,6 +1116,40 @@ func (m *model) applySelectedCommitPicker() tea.Cmd {
 	return m.refreshFiles()
 }
 
+func (m *model) toggleCommitCompare() tea.Cmd {
+	if m.mode == domain.ModeConflict {
+		return nil
+	}
+
+	commit := m.selectedCommitValue()
+	if commit == nil {
+		m.actionMessage = "No commit selected."
+		return nil
+	}
+
+	m.customCompare = nil
+	if m.compareAnchor == commit.SHA {
+		m.compareAnchor = ""
+		m.mode = domain.ModeHistory
+		m.actionMessage = "Cleared compare anchor."
+		return m.refreshFiles()
+	}
+
+	if m.compareAnchor == "" {
+		m.compareAnchor = commit.SHA
+		m.mode = domain.ModeCompareCommits
+		m.actionMessage = fmt.Sprintf("Anchored %s for compare. Move to another commit and press Enter again.", commit.ShortSHA)
+		return m.refreshFiles()
+	}
+
+	anchor := m.commitBySHA(m.compareAnchor)
+	m.mode = domain.ModeCompareCommits
+	if anchor != nil {
+		m.actionMessage = fmt.Sprintf("Comparing %s to %s.", anchor.ShortSHA, commit.ShortSHA)
+	}
+	return m.refreshFiles()
+}
+
 func selectFileIndexByPath(files []domain.FileChange, path string) int {
 	if path == "" {
 		return 0
@@ -1407,6 +1441,81 @@ func (m *model) currentConflictInlineSummary(width int) string {
 		summary = trimToWidth(summary, width)
 	}
 	return summary
+}
+
+func conflictBlockRenderedLineCount(block conflicts.Block) int {
+	count := 2 + len(block.Ours) + len(block.Theirs)
+	if len(block.Base) > 0 {
+		count += 1 + len(block.Base)
+	}
+	return count
+}
+
+func (m *model) currentConflictResultLines(width, height int) []string {
+	if m.mode != domain.ModeConflict || m.conflictContents == nil || width <= 0 || height <= 0 {
+		return nil
+	}
+
+	block := m.currentConflictBlock(m.currentDiffContentWidth())
+	if block == nil {
+		return nil
+	}
+
+	lines := strings.Split(strings.ReplaceAll(m.conflictContents.Merged, "\r", ""), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+
+	startLine := maxInt(1, block.StartMergedLine-2)
+	endLine := minInt(len(lines), block.StartMergedLine+conflictBlockRenderedLineCount(*block)+1)
+	window := lines[startLine-1 : endLine]
+
+	rendered := make([]string, 0, minInt(len(window), height))
+	for index, line := range window {
+		lineNumber := startLine + index
+		label := fmt.Sprintf("%4d │ ", lineNumber)
+		bodyWidth := maxInt(8, width-lipgloss.Width(label))
+		text := trimToWidth(line, bodyWidth)
+		row := styleMuted.Render(label) + text
+		if strings.HasPrefix(line, "<<<<<<< ") || strings.HasPrefix(line, "||||||| ") || line == "=======" || strings.HasPrefix(line, ">>>>>>> ") {
+			row = styleMuted.Render(trimToWidth(label+line, width))
+		} else if lineNumber >= block.StartMergedLine && lineNumber < block.StartMergedLine+conflictBlockRenderedLineCount(*block) {
+			row = styleSelectedDiffLine.Width(width).Render(trimToWidth(label+line, width))
+		}
+		rendered = append(rendered, row)
+		if len(rendered) >= height {
+			break
+		}
+	}
+
+	return rendered
+}
+
+func (m *model) renderConflictResultPane(width, height int) string {
+	lines := []string{
+		styleAccent.Render("Merge Result"),
+	}
+
+	block := m.currentConflictBlock(m.currentDiffContentWidth())
+	if block == nil {
+		lines = append(lines, styleMuted.Render("Move the diff cursor onto a conflict block to inspect merged output."))
+	} else {
+		target := m.currentConflictSide(m.currentDiffContentWidth())
+		lines = append(lines, styleMuted.Render(fmt.Sprintf("Conflict %d  |  target %s  |  merged file context", block.Index+1, target)))
+		lines = append(lines, m.currentConflictResultLines(width-4, maxInt(1, height-4))...)
+	}
+	lines = append(lines, styleMuted.Render("The merged file updates here after block actions."))
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("8")).
+		Width(width).
+		Height(height).
+		Padding(0, 1).
+		Render(strings.Join(lines, "\n"))
 }
 
 func (m *model) emptyDiffMessage() string {
@@ -2054,7 +2163,7 @@ func (m *model) diffViewLabel() string {
 }
 
 func (m *model) currentActionHints() []string {
-	hints := []string{"[tab] cycle", "[h/l] left diff", "[j/k] move", "[:] menu", "[?] keys"}
+	hints := []string{"[tab] cycle", "[h/l] left diff", "[j/k] move", "[enter] act", "[:] menu", "[?] keys"}
 	if m.mode == domain.ModeConflict {
 		hints = append(hints, "[[]/[]] conflicts", "[H/L] side", "[enter] apply", "[1/2/3] resolve", "[K] base", "[F] fullscreen")
 		return hints
@@ -2092,6 +2201,7 @@ func (m *model) currentKeyBindings() []keyBinding {
 			keyBinding{section: "Conflict", key: "[ ]", label: "jump between conflict blocks"},
 			keyBinding{section: "Conflict", key: "H L", label: "target ours vs theirs for status and editor jumps"},
 			keyBinding{section: "Conflict", key: "enter", label: "apply the currently targeted side to the selected block"},
+			keyBinding{section: "Conflict", key: "result pane", label: "shows live merged-file context for the selected block"},
 			keyBinding{section: "Conflict", key: "K", label: "show base detail for the selected conflict"},
 			keyBinding{section: "Conflict", key: "1", label: "accept ours for the selected block"},
 			keyBinding{section: "Conflict", key: "2", label: "accept theirs for the selected block"},
@@ -2106,6 +2216,7 @@ func (m *model) currentKeyBindings() []keyBinding {
 
 	bindings = append(bindings,
 		keyBinding{section: "Review", key: "enter", label: "compare the selected file against Working Tree or another commit"},
+		keyBinding{section: "Compare", key: "enter (commits)", label: "anchor or compare the selected commit from the graph"},
 		keyBinding{section: "Review", key: "[ ]", label: "jump between hunks or change blocks"},
 		keyBinding{section: "Review", key: "B", label: "toggle inline blame"},
 		keyBinding{section: "Review", key: "K", label: "show blame detail for the selected line"},
@@ -2724,6 +2835,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+			if m.focus == focusCommits {
+				return m, m.toggleCommitCompare()
+			}
 			if m.focus == focusFiles {
 				m.openCommitPicker()
 				return m, nil
@@ -2838,25 +2952,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "v":
-			if m.mode == domain.ModeConflict {
-				return m, nil
-			}
-
-			commit := m.selectedCommitValue()
-			if commit == nil {
-				return m, nil
-			}
-
-			if m.compareAnchor == commit.SHA {
-				m.compareAnchor = ""
-				m.customCompare = nil
-				m.mode = domain.ModeHistory
-			} else {
-				m.customCompare = nil
-				m.compareAnchor = commit.SHA
-				m.mode = domain.ModeCompareCommits
-			}
-			return m, m.refreshFiles()
+			return m, m.toggleCommitCompare()
 		case "1":
 			if m.mode == domain.ModeConflict && m.repo != nil {
 				conflict := m.selectedConflictValue()
@@ -3118,6 +3214,9 @@ func (m *model) diffRenderWidth(totalWidth int) int {
 func (m *model) renderCommitsPane(width, height int) string {
 	lines := []string{}
 	title := fmt.Sprintf("Commits (%d)", len(m.commits))
+	if m.focus == focusCommits {
+		title += " [enter compare]"
+	}
 	if selected := m.selectedCommitValue(); selected != nil && len(selected.Refs) > 0 {
 		title += " " + trimToWidth(renderInlineRefs(selected.Refs), maxInt(10, width-lipgloss.Width(title)-4))
 	}
@@ -3130,7 +3229,17 @@ func (m *model) renderCommitsPane(width, height int) string {
 			styleMuted.Render(fmt.Sprintf("Cherry-pick: %t", m.repo != nil && m.repo.IsCherryPick)),
 		)
 	} else {
-		start, end := visibleListRange(len(m.commits), m.selectedCommit, height-2)
+		if anchor := m.commitBySHA(m.compareAnchor); anchor != nil {
+			selected := m.selectedCommitValue()
+			if selected != nil && selected.SHA != anchor.SHA {
+				lines = append(lines, styleMode.Render(fmt.Sprintf("Compare: %s -> %s", anchor.ShortSHA, selected.ShortSHA)))
+			} else {
+				lines = append(lines, styleMode.Render(fmt.Sprintf("Anchor: %s  |  press Enter on another commit", anchor.ShortSHA)))
+			}
+		} else if selected := m.selectedCommitValue(); selected != nil {
+			lines = append(lines, styleMuted.Render(trimToWidth("Selected: "+selected.ShortSHA+" "+selected.Subject, width-4)))
+		}
+		start, end := visibleListRange(len(m.commits), m.selectedCommit, height-2-len(lines))
 		for i := start; i < end; i++ {
 			commit := m.commits[i]
 			lines = append(lines, m.renderCommitLine(commit, i == m.selectedCommit, width-4))
@@ -3141,7 +3250,7 @@ func (m *model) renderCommitsPane(width, height int) string {
 		lines = append(lines, styleMuted.Render("No commits loaded."))
 	}
 
-	return paneStyle(width, height, m.focus == focusCommits).Render(title + "\n\n" + strings.Join(lines, "\n"))
+	return paneStyle(width, height, m.focus == focusCommits).Render(styleTitle.Render(title) + "\n\n" + strings.Join(lines, "\n"))
 }
 
 func (m *model) renderPalette(width, height int) string {
@@ -3366,7 +3475,7 @@ func (m *model) renderFilesPane(width, height int) string {
 	lines := []string{}
 	title := fmt.Sprintf("Files (%d)", len(m.files))
 	if m.focus == focusFiles {
-		title += " [enter compares file]"
+		title += " [enter compare]"
 	}
 	if m.loadingFiles {
 		lines = append(lines, styleAccent.Render("Loading files..."))
@@ -3378,7 +3487,7 @@ func (m *model) renderFilesPane(width, height int) string {
 	start, end := visibleListRange(len(m.files), m.selectedFile, height-2-len(lines))
 	for i := start; i < end; i++ {
 		file := m.files[i]
-		line := file.Status + " " + file.Path
+		line := renderFileStatusBadge(file.Status) + " " + file.Path
 		if file.OldPath != "" {
 			line += " <- " + file.OldPath
 		}
@@ -3398,7 +3507,7 @@ func (m *model) renderFilesPane(width, height int) string {
 		lines = append(lines, styleMuted.Render("No files loaded."))
 	}
 
-	return paneStyle(width, height, m.focus == focusFiles).Render(title + "\n\n" + strings.Join(lines, "\n"))
+	return paneStyle(width, height, m.focus == focusFiles).Render(styleTitle.Render(title) + "\n\n" + strings.Join(lines, "\n"))
 }
 
 func (m *model) renderDiffPane(width, height int) string {
@@ -3428,13 +3537,24 @@ func (m *model) renderDiffPane(width, height int) string {
 	if summary := m.currentConflictInlineSummary(width - 4); summary != "" {
 		lines = append(lines, styleMuted.Width(width-4).Render(summary))
 	}
-	lines = append(lines, m.renderDiffLines(width-4, maxInt(1, height-3-len(lines)))...)
+	resultPane := ""
+	resultPaneHeight := 0
+	if m.mode == domain.ModeConflict && m.currentConflictBlock(m.currentDiffContentWidth()) != nil {
+		resultPaneHeight = minInt(10, maxInt(6, height/4))
+	}
+	lines = append(lines, m.renderDiffLines(width-4, maxInt(1, height-3-len(lines)-resultPaneHeight))...)
+	if resultPaneHeight > 0 {
+		resultPane = m.renderConflictResultPane(width-4, resultPaneHeight)
+	}
 
 	if file := m.selectedFileValue(); file != nil {
 		title = "Diff [" + viewLabel + "]: " + trimToWidth(file.Path, width-20)
 	}
-
-	return paneStyle(width, height, m.focus == focusDiff).Render(title + "\n\n" + strings.Join(lines, "\n"))
+	body := strings.Join(lines, "\n")
+	if resultPane != "" {
+		body = body + "\n\n" + resultPane
+	}
+	return paneStyle(width, height, m.focus == focusDiff).Render(styleTitle.Render(title) + "\n\n" + body)
 }
 
 func (m *model) renderCommitLine(commit domain.CommitSummary, selected bool, width int) string {
@@ -3723,6 +3843,22 @@ func renderInlineRefs(refs []string) string {
 	}
 
 	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+func renderFileStatusBadge(status string) string {
+	label := " " + strings.TrimSpace(status) + " "
+	switch status {
+	case "A":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("22")).Bold(true).Render(label)
+	case "D":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("52")).Bold(true).Render(label)
+	case "R":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("60")).Bold(true).Render(label)
+	case "U":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("88")).Bold(true).Render(label)
+	default:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("24")).Bold(true).Render(label)
+	}
 }
 
 func renderGraphLead(graph string, selected bool) string {
