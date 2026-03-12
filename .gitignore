@@ -2,4 +2,4 @@
 .tmp-conflict-repo
 bin/
 dist/
-better-diff
+/better-diff

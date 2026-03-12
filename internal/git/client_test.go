@@ -14,7 +14,32 @@ import (
 func smokeRepoPath(t *testing.T) string {
 	t.Helper()
 
-	return filepath.Clean(filepath.Join("..", "..", ".tmp-smoke-repo"))
+	repo := t.TempDir()
+	runTestGit(t, repo, "init", "-b", "master")
+	runTestGit(t, repo, "config", "user.name", "Test User")
+	runTestGit(t, repo, "config", "user.email", "test@example.com")
+
+	path := filepath.Join(repo, "demo.txt")
+	if err := os.WriteFile(path, []byte("alpha\nbeta\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(initial) returned error: %v", err)
+	}
+	runTestGit(t, repo, "add", "demo.txt")
+	runTestGit(t, repo, "commit", "-m", "Initial alpha")
+
+	if err := os.WriteFile(path, []byte("alpha\nbeta\ngamma\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(base) returned error: %v", err)
+	}
+	runTestGit(t, repo, "add", "demo.txt")
+	runTestGit(t, repo, "commit", "-m", "Base gamma")
+
+	runTestGit(t, repo, "checkout", "-b", "feature")
+	if err := os.WriteFile(path, []byte("alpha\nbeta\ngamma\ndelta\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(feature) returned error: %v", err)
+	}
+	runTestGit(t, repo, "add", "demo.txt")
+	runTestGit(t, repo, "commit", "-m", "Feature delta")
+
+	return repo
 }
 
 func runTestGit(t *testing.T, cwd string, args ...string) {
@@ -60,8 +85,8 @@ func TestListCommits(t *testing.T) {
 	}
 
 	head := commits[0]
-	if got, want := head.ShortSHA, "dedb968"; got != want {
-		t.Fatalf("head.ShortSHA = %q, want %q", got, want)
+	if head.ShortSHA == "" {
+		t.Fatal("head.ShortSHA should not be empty")
 	}
 	if !strings.Contains(head.Subject, "Feature delta") {
 		t.Fatalf("head.Subject = %q, want to contain %q", head.Subject, "Feature delta")
