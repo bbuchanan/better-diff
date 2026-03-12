@@ -111,6 +111,32 @@ By default this installs to:
 ~/bin/better-diff
 ```
 
+### Update from source in one step
+
+On a machine where you already cloned the repo:
+
+```sh
+./scripts/update.sh
+```
+
+That will:
+
+- `git pull --ff-only`
+- build the current source
+- install `better-diff` to `~/bin/better-diff`
+
+Install somewhere else:
+
+```sh
+PREFIX=/usr/local/bin ./scripts/update.sh
+```
+
+If you prefer `make`:
+
+```sh
+make update
+```
+
 Install somewhere else:
 
 ```sh

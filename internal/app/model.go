@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -3264,10 +3265,13 @@ func (m *model) renderCommitsPane(width, height int) string {
 		} else if selected := m.selectedCommitValue(); selected != nil {
 			lines = append(lines, styleMuted.Render(trimToWidth("Selected: "+selected.ShortSHA+" "+selected.Subject, width-4)))
 		}
-		start, end := visibleListRange(len(m.commits), m.selectedCommit, height-2-len(lines))
+		start, end := visibleListRange(len(m.commits), m.selectedCommit, maxInt(1, height-3-len(lines)))
 		for i := start; i < end; i++ {
 			commit := m.commits[i]
 			lines = append(lines, m.renderCommitLine(commit, i == m.selectedCommit, width-4))
+		}
+		if len(m.commits) > 0 {
+			lines = append(lines, renderCommitWindowFooter(start, end, len(m.commits), width-4))
 		}
 	}
 
@@ -3609,16 +3613,24 @@ func (m *model) renderCommitLine(commit domain.CommitSummary, selected bool, wid
 	}
 	shaWidth := lipgloss.Width(commit.ShortSHA)
 
-	badgesRendered, badgesWidth := renderRefBadges(commit.Refs, maxInt(0, width/3), selected)
+	initialsPlain := authorInitials(commit.AuthorName)
+	initialsRendered := renderAuthorInitials(initialsPlain, selected)
+	initialsWidth := lipgloss.Width(initialsPlain)
 
-	subjectBudget := width - graphWidth - shaWidth - 1
+	badgesRendered := ""
+	badgesWidth := 0
+	if selected || len(commit.Refs) > 0 {
+		badgesRendered, badgesWidth = renderRefBadges(commit.Refs, maxInt(0, width/4), selected)
+	}
+
+	subjectBudget := width - graphWidth - shaWidth - initialsWidth - 3
 	if badgesWidth > 0 {
 		subjectBudget -= badgesWidth + 1
 	}
 	if subjectBudget < 12 && badgesWidth > 0 {
 		badgesRendered = ""
 		badgesWidth = 0
-		subjectBudget = width - graphWidth - shaWidth - 1
+		subjectBudget = width - graphWidth - shaWidth - initialsWidth - 3
 	}
 	subjectBudget = maxInt(8, subjectBudget)
 	subject := trimToWidth(commit.Subject, subjectBudget)
@@ -3627,7 +3639,7 @@ func (m *model) renderCommitLine(commit domain.CommitSummary, selected bool, wid
 	if graphRendered != "" {
 		parts = append(parts, graphRendered)
 	}
-	parts = append(parts, shaRendered, " "+subject)
+	parts = append(parts, shaRendered, " ", initialsRendered, " ", subject)
 	if badgesRendered != "" {
 		parts = append(parts, " ", badgesRendered)
 	}
@@ -3767,6 +3779,7 @@ var (
 	styleGraphNode      = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
 	styleAnchor         = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 	styleSHA            = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
+	styleAuthorInitials = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
 	styleRefHead        = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("25")).Bold(true)
 	styleRefBranch      = lipgloss.NewStyle().Foreground(lipgloss.Color("153")).Background(lipgloss.Color("237"))
 	styleRefTag         = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("60"))
@@ -3778,6 +3791,7 @@ var (
 	styleSelectedGraphNode = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("25")).Bold(true)
 	styleSelectedAnchor    = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("25")).Bold(true)
 	styleSelectedSHA       = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("25")).Bold(true)
+	styleSelectedInitials  = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("25")).Bold(true)
 	styleSelectedRefHead   = lipgloss.NewStyle().Foreground(lipgloss.Color("25")).Background(lipgloss.Color("230")).Bold(true)
 	styleSelectedRefBranch = lipgloss.NewStyle().Foreground(lipgloss.Color("25")).Background(lipgloss.Color("195"))
 	styleSelectedRefTag    = lipgloss.NewStyle().Foreground(lipgloss.Color("25")).Background(lipgloss.Color("229"))
@@ -3963,6 +3977,54 @@ func renderSelectedDiffRow(row string, width int) string {
 	return styleSelectedDiffLine.Width(width).Render(row)
 }
 
+func authorInitials(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "??"
+	}
+	fields := strings.Fields(name)
+	if len(fields) == 1 {
+		runes := []rune(fields[0])
+		if len(runes) >= 2 {
+			return strings.ToUpper(string(runes[:2]))
+		}
+		return strings.ToUpper(fields[0])
+	}
+	return strings.ToUpper(string([]rune(fields[0])[0]) + string([]rune(fields[len(fields)-1])[0]))
+}
+
+func renderAuthorInitials(initials string, selected bool) string {
+	if selected {
+		return styleSelectedInitials.Render(initials)
+	}
+	return styleAuthorInitials.Render(initials)
+}
+
+func renderCommitWindowFooter(start, end, total, width int) string {
+	if total <= 0 || width <= 0 {
+		return ""
+	}
+	left := fmt.Sprintf("%d-%d of %d", start+1, end, total)
+	barWidth := clampInt(width-lipgloss.Width(left)-3, 8, 18)
+	filled := 1
+	if total > 0 {
+		filled = maxInt(1, int(math.Round(float64(end-start)/float64(total)*float64(barWidth))))
+	}
+	progress := 0
+	if total > 1 {
+		progress = int(math.Round(float64(start) / float64(total-1) * float64(maxInt(0, barWidth-filled))))
+	}
+	bar := strings.Repeat("░", barWidth)
+	if filled > 0 && progress+filled <= len([]rune(bar)) {
+		runes := []rune(bar)
+		for i := progress; i < progress+filled && i < len(runes); i++ {
+			runes[i] = '█'
+		}
+		bar = string(runes)
+	}
+	return styleMuted.Width(width).Render(trimToWidth(left+"  "+bar, width))
+}
+
 func firstSelectableDiffRow(document renderedDiff) int {
 	for index, meta := range document.rowMeta {
 		switch meta.Kind {
@@ -3996,7 +4058,9 @@ func renderGraphLead(graph string, selected bool) string {
 		return ""
 	}
 
+	laneColors := []lipgloss.Color{"45", "39", "214", "111", "44"}
 	var builder strings.Builder
+	laneIndex := 0
 	for _, r := range graph {
 		switch r {
 		case '*':
@@ -4012,13 +4076,30 @@ func renderGraphLead(graph string, selected bool) string {
 				builder.WriteString(styleAnchor.Render("•"))
 			}
 		case '|', '/', '\\', '_':
+			style := lipgloss.NewStyle().Foreground(laneColors[laneIndex%len(laneColors)])
 			if selected {
-				builder.WriteString(styleSelectedGraphLane.Render(string(r)))
-			} else {
-				builder.WriteString(styleGraphLane.Render(string(r)))
+				style = style.Background(lipgloss.Color("25"))
 			}
-		default:
+			builder.WriteString(style.Render(string(r)))
+			laneIndex++
+		case 'o', 'O':
+			style := lipgloss.NewStyle().Foreground(laneColors[laneIndex%len(laneColors)]).Bold(true)
+			if selected {
+				style = style.Background(lipgloss.Color("25"))
+			}
+			builder.WriteString(style.Render("◦"))
+			laneIndex++
+		case ' ':
 			builder.WriteRune(r)
+		default:
+			style := lipgloss.NewStyle().Foreground(laneColors[laneIndex%len(laneColors)])
+			if selected {
+				style = style.Background(lipgloss.Color("25"))
+			}
+			builder.WriteString(style.Render(string(r)))
+			if r != ' ' {
+				laneIndex++
+			}
 		}
 	}
 	return builder.String()

@@ -18,7 +18,7 @@ LINUX_AMD64_ARCHIVE := $(DIST_DIR)/$(APP_NAME)_linux_amd64.tar.gz
 LINUX_ARM64_ARCHIVE := $(DIST_DIR)/$(APP_NAME)_linux_arm64.tar.gz
 WINDOWS_AMD64_ARCHIVE := $(DIST_DIR)/$(APP_NAME)_windows_amd64.zip
 
-.PHONY: test build build-mac build-all dist-mac dist-all install clean
+.PHONY: test build build-mac build-all dist-mac dist-all install update clean
 
 test:
 	go test ./...
@@ -67,6 +67,9 @@ dist-all: build-all
 
 install: build
 	./scripts/install.sh $(BIN_DIR)/$(APP_NAME)
+
+update:
+	./scripts/update.sh
 
 clean:
 	rm -rf $(BIN_DIR) $(DIST_DIR)
