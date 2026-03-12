@@ -983,6 +983,7 @@ func (m *model) applySelectedRefPickerRef() tea.Cmd {
 		DiffStyle:  m.presetDiffStyle,
 	}
 	m.mode = domain.ModeCompareRefs
+	m.focus = focusDiff
 	m.actionMessage = fmt.Sprintf("Comparing %s...%s", m.refPickerLeft.Name, m.refPickerRight.Name)
 	return m.refreshFiles()
 }
@@ -1082,6 +1083,7 @@ func (m *model) applySelectedCommitPicker() tea.Cmd {
 	m.commitPickerQuery = ""
 	m.commitPickerSelect = 0
 	m.preferredFilePath = file.Path
+	m.focus = focusDiff
 	if selected.SHA == gitadapter.IndexRef {
 		m.compareAnchor = ""
 		m.customCompare = &domain.CompareSelection{
@@ -1092,7 +1094,7 @@ func (m *model) applySelectedCommitPicker() tea.Cmd {
 			DiffStyle:  domain.DiffTwoDot,
 		}
 		m.mode = domain.ModeCompareRefs
-		m.actionMessage = fmt.Sprintf("Comparing %s between %s and Index", file.Path, current.ShortSHA)
+		m.actionMessage = fmt.Sprintf("Comparing %s | %s -> Index", file.Path, formatCompareTargetLabel(current))
 		return m.refreshFiles()
 	}
 	if selected.SHA == gitadapter.WorkingTreeRef {
@@ -1105,14 +1107,14 @@ func (m *model) applySelectedCommitPicker() tea.Cmd {
 			DiffStyle:  domain.DiffTwoDot,
 		}
 		m.mode = domain.ModeCompareRefs
-		m.actionMessage = fmt.Sprintf("Comparing %s between %s and Working Tree", file.Path, current.ShortSHA)
+		m.actionMessage = fmt.Sprintf("Comparing %s | %s -> Working Tree", file.Path, formatCompareTargetLabel(current))
 		return m.refreshFiles()
 	}
 
 	m.compareAnchor = selected.SHA
 	m.customCompare = nil
 	m.mode = domain.ModeCompareCommits
-	m.actionMessage = fmt.Sprintf("Comparing %s between %s and %s", file.Path, selected.ShortSHA, current.ShortSHA)
+	m.actionMessage = fmt.Sprintf("Comparing %s | %s -> %s", file.Path, formatCompareTargetLabel(selected), formatCompareTargetLabel(current))
 	return m.refreshFiles()
 }
 
@@ -1792,6 +1794,23 @@ func (m *model) syncDiffCursor(width int) renderedDiff {
 	return document
 }
 
+func (m *model) resetDiffCursorToContentStart(width int) {
+	if width <= 0 {
+		width = 80
+	}
+
+	document := m.renderDocument(width)
+	if len(document.rows) == 0 {
+		m.diffCursor = 0
+		m.diffScroll = 0
+		return
+	}
+
+	m.diffCursor = firstSelectableDiffRow(document)
+	m.diffScroll = 0
+	m.syncDiffCursor(width)
+}
+
 func (m *model) moveDiffCursor(delta int, width int) {
 	document := m.renderDocument(width)
 	if len(document.rows) == 0 {
@@ -1963,6 +1982,7 @@ func (m *model) refreshDiff() tea.Cmd {
 				m.loadingDiff = false
 				copy := cached
 				m.conflictContents = &copy
+				m.resetDiffCursorToContentStart(m.currentDiffContentWidth())
 				return nil
 			}
 		} else if m.diffViewMode == diffViewFullFile {
@@ -1971,12 +1991,14 @@ func (m *model) refreshDiff() tea.Cmd {
 				copy := cached
 				m.fullFileCompare = &copy
 				m.diffLoaded = true
+				m.resetDiffCursorToContentStart(m.currentDiffContentWidth())
 				return m.maybeLoadBlame()
 			}
 		} else if cached, ok := m.diffCache[cacheKey]; ok {
 			m.loadingDiff = false
 			m.diff = cached
 			m.diffLoaded = true
+			m.resetDiffCursorToContentStart(m.currentDiffContentWidth())
 			return m.maybeLoadBlame()
 		}
 	}
@@ -2569,6 +2591,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			copy := *msg.compare
 			m.fullFileCompare = &copy
 			m.diffLoaded = true
+			m.resetDiffCursorToContentStart(m.currentDiffContentWidth())
 		}
 		return m, nil
 	case diffLoadedMsg:
@@ -2584,6 +2607,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.key == m.currentDiffCacheKey() {
 				copy := *msg.conflict
 				m.conflictContents = &copy
+				m.resetDiffCursorToContentStart(m.currentDiffContentWidth())
 			}
 			return m, nil
 		}
@@ -2597,6 +2621,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.key == m.currentDiffCacheKey() {
 			m.diff = msg.diff
 			m.diffLoaded = true
+			m.resetDiffCursorToContentStart(m.currentDiffContentWidth())
 		}
 		return m, nil
 	case actionDoneMsg:
@@ -3232,7 +3257,7 @@ func (m *model) renderCommitsPane(width, height int) string {
 		if anchor := m.commitBySHA(m.compareAnchor); anchor != nil {
 			selected := m.selectedCommitValue()
 			if selected != nil && selected.SHA != anchor.SHA {
-				lines = append(lines, styleMode.Render(fmt.Sprintf("Compare: %s -> %s", anchor.ShortSHA, selected.ShortSHA)))
+				lines = append(lines, styleMode.Render(trimToWidth("Compare: "+formatCompareTargetLabel(anchor)+" -> "+formatCompareTargetLabel(selected), maxInt(10, width-4))))
 			} else {
 				lines = append(lines, styleMode.Render(fmt.Sprintf("Anchor: %s  |  press Enter on another commit", anchor.ShortSHA)))
 			}
@@ -3341,13 +3366,7 @@ func (m *model) renderCommitPicker(width, height int) string {
 	} else {
 		start, end := visibleListRange(len(commits), m.commitPickerSelect, height-len(lines)-2)
 		for i := start; i < end; i++ {
-			prefix := "  "
-			if i == m.commitPickerSelect {
-				prefix = "> "
-			}
-			commit := commits[i]
-			line := fmt.Sprintf("%s%s  %s", prefix, commit.ShortSHA, trimToWidth(commit.Subject, maxInt(8, width-18)))
-			lines = append(lines, trimToWidth(line, width-4))
+			lines = append(lines, renderCommitPickerLine(commits[i], width-4, i == m.commitPickerSelect))
 		}
 	}
 
@@ -3483,6 +3502,9 @@ func (m *model) renderFilesPane(width, height int) string {
 	if m.filesErr != "" {
 		lines = append(lines, styleMuted.Render(m.filesErr))
 	}
+	if file := m.selectedFileValue(); file != nil {
+		lines = append(lines, styleMuted.Render(trimToWidth("Selected: "+file.Path, width-4)))
+	}
 
 	start, end := visibleListRange(len(m.files), m.selectedFile, height-2-len(lines))
 	for i := start; i < end; i++ {
@@ -3492,9 +3514,9 @@ func (m *model) renderFilesPane(width, height int) string {
 		case selected:
 			lines = append(lines, renderSelectedFileLine(file, width-4))
 		default:
-			line := renderFileStatusBadge(file.Status, false) + " " + file.Path
+			line := renderFileStatusBadge(file.Status, false) + " " + trimPathMiddle(file.Path, maxInt(1, width-8))
 			if file.OldPath != "" {
-				line += " <- " + file.OldPath
+				line += " <- " + trimPathMiddle(file.OldPath, maxInt(1, width-lipgloss.Width(line)-4))
 			}
 			line = trimToWidth(line, width-4)
 			if file.Status == "U" {
@@ -3572,6 +3594,7 @@ func (m *model) renderCommitLine(commit domain.CommitSummary, selected bool, wid
 			graphPlain = "•"
 		}
 	}
+	graphPlain = compactGraphLead(graphPlain, maxInt(4, width/5))
 
 	graphRendered := renderGraphLead(graphPlain, selected)
 	graphWidth := lipgloss.Width(graphPlain)
@@ -3640,7 +3663,7 @@ func (m *model) renderDiffLines(width, height int) []string {
 		for index := start; index < end; index++ {
 			row := document.rows[index]
 			if index == m.diffCursor {
-				row = styleSelectedDiffLine.Width(width).Render(row)
+				row = renderSelectedDiffRow(row, width)
 			}
 			lines = append(lines, row)
 		}
@@ -3669,7 +3692,7 @@ func (m *model) renderDiffLines(width, height int) []string {
 		}
 		row := document.rows[index]
 		if index == m.diffCursor {
-			row = styleSelectedDiffLine.Width(width).Render(row)
+			row = renderSelectedDiffRow(row, width)
 		}
 		lines = append(lines, row)
 	}
@@ -3766,7 +3789,8 @@ var (
 			Foreground(lipgloss.Color("250")).
 			Background(lipgloss.Color("237"))
 	styleSelectedDiffLine = lipgloss.NewStyle().
-				Background(lipgloss.Color("236"))
+				Foreground(lipgloss.Color("230")).
+				Background(lipgloss.Color("24"))
 )
 
 func trimToWidth(value string, width int) string {
@@ -3847,6 +3871,33 @@ func renderInlineRefs(refs []string) string {
 	return "[" + strings.Join(parts, ", ") + "]"
 }
 
+func trimPathMiddle(path string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(path) <= width {
+		return path
+	}
+
+	parts := strings.Split(path, "/")
+	if len(parts) <= 1 {
+		return trimToWidth(path, width)
+	}
+
+	base := parts[len(parts)-1]
+	if lipgloss.Width(base)+4 >= width {
+		return ".../" + trimToWidth(base, maxInt(1, width-4))
+	}
+
+	first := parts[0]
+	candidate := first + "/.../" + base
+	if lipgloss.Width(candidate) <= width {
+		return candidate
+	}
+
+	return ".../" + base
+}
+
 func renderFileStatusBadge(status string, selected bool) string {
 	label := " " + strings.TrimSpace(status) + " "
 	switch status {
@@ -3864,11 +3915,80 @@ func renderFileStatusBadge(status string, selected bool) string {
 }
 
 func renderSelectedFileLine(file domain.FileChange, width int) string {
-	line := strings.TrimSpace(file.Status) + " " + file.Path
+	line := strings.TrimSpace(file.Status) + " " + trimPathMiddle(file.Path, maxInt(1, width-2))
 	if file.OldPath != "" {
-		line += " <- " + file.OldPath
+		line += " <- " + trimPathMiddle(file.OldPath, maxInt(1, width-lipgloss.Width(line)-4))
 	}
 	return styleSelectedFile.Width(width).Render(trimToWidth(line, width))
+}
+
+func renderCommitPickerLine(commit domain.CommitSummary, width int, selected bool) string {
+	prefix := "  "
+	if selected {
+		prefix = "> "
+	}
+
+	if commit.SHA == gitadapter.WorkingTreeRef || commit.SHA == gitadapter.IndexRef {
+		line := prefix + commit.ShortSHA + "  " + commit.Subject
+		return trimToWidth(line, width)
+	}
+
+	meta := commit.AuthoredAt
+	if len(commit.Refs) > 0 {
+		meta += "  " + strings.Join(commit.Refs, ", ")
+	} else if commit.AuthorName != "" {
+		meta += "  " + commit.AuthorName
+	}
+
+	line := fmt.Sprintf("%s%-8s %-24s %s", prefix, commit.ShortSHA, trimToWidth(meta, 24), commit.Subject)
+	return trimToWidth(line, width)
+}
+
+func compactGraphLead(graph string, maxWidth int) string {
+	graph = strings.TrimRight(graph, " ")
+	if maxWidth <= 0 || lipgloss.Width(graph) <= maxWidth {
+		return graph
+	}
+	runes := []rune(graph)
+	if len(runes) <= maxWidth {
+		return graph
+	}
+	return "…" + string(runes[len(runes)-maxWidth+1:])
+}
+
+func renderSelectedDiffRow(row string, width int) string {
+	if width <= 0 {
+		return row
+	}
+	return styleSelectedDiffLine.Width(width).Render(row)
+}
+
+func firstSelectableDiffRow(document renderedDiff) int {
+	for index, meta := range document.rowMeta {
+		switch meta.Kind {
+		case render.LineContext, render.LineAdd, render.LineDelete:
+			return index
+		}
+	}
+	if len(document.hunkRows) > 0 {
+		return document.hunkRows[0]
+	}
+	return 0
+}
+
+func formatCompareTargetLabel(commit *domain.CommitSummary) string {
+	if commit == nil {
+		return ""
+	}
+
+	parts := []string{commit.ShortSHA}
+	if commit.AuthoredAt != "" {
+		parts = append(parts, commit.AuthoredAt)
+	}
+	if len(commit.Refs) > 0 {
+		parts = append(parts, strings.Join(commit.Refs, ", "))
+	}
+	return strings.Join(parts, " · ")
 }
 
 func renderGraphLead(graph string, selected bool) string {

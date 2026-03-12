@@ -11,6 +11,17 @@ import (
 	"better-diff/internal/render"
 )
 
+const headerHeavyDiff = `diff --git a/demo.go b/demo.go
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/demo.go
+@@ -0,0 +1,3 @@
++package demo
++
++func alpha() {}
+`
+
 func TestHelpOverlayScrollClampsAndCanRecoverUpward(t *testing.T) {
 	m := &model{
 		helpOpen: true,
@@ -63,7 +74,7 @@ func TestApplySelectedCommitPickerUsesWorkingTreeCompare(t *testing.T) {
 		selectedCommit: 0,
 		selectedFile:   0,
 		commits: []domain.CommitSummary{
-			{SHA: "head-sha", ShortSHA: "head", Subject: "current"},
+			{SHA: "head-sha", ShortSHA: "head", Subject: "current", AuthoredAt: "2026-03-11", Refs: []string{"HEAD", "master"}},
 			{SHA: "older-sha", ShortSHA: "old", Subject: "older"},
 		},
 		files: []domain.FileChange{
@@ -95,6 +106,73 @@ func TestApplySelectedCommitPickerUsesWorkingTreeCompare(t *testing.T) {
 	}
 	if !strings.Contains(m.actionMessage, "Working Tree") {
 		t.Fatalf("actionMessage = %q, want Working Tree mention", m.actionMessage)
+	}
+	if !strings.Contains(m.actionMessage, "2026-03-11") || !strings.Contains(m.actionMessage, "HEAD, master") {
+		t.Fatalf("actionMessage = %q, want commit context", m.actionMessage)
+	}
+	if got, want := m.focus, focusDiff; got != want {
+		t.Fatalf("focus = %v, want %v", got, want)
+	}
+}
+
+func TestApplySelectedCommitPickerFormatsCommitCompareMessage(t *testing.T) {
+	m := &model{
+		mode:               domain.ModeHistory,
+		selectedCommit:     0,
+		selectedFile:       0,
+		commitPickerOpen:   true,
+		commitPickerSelect: 2,
+		commits: []domain.CommitSummary{
+			{SHA: "head-sha", ShortSHA: "head", Subject: "current", AuthoredAt: "2026-03-11", Refs: []string{"HEAD", "master"}},
+			{SHA: "older-sha", ShortSHA: "old", Subject: "older", AuthoredAt: "2026-03-10", Refs: []string{"feature/demo"}},
+		},
+		files: []domain.FileChange{
+			{Path: "demo.txt", Status: "M"},
+		},
+	}
+
+	cmd := m.applySelectedCommitPicker()
+	if cmd != nil {
+		t.Fatal("expected nil refresh command without a loaded repo")
+	}
+	if !strings.Contains(m.actionMessage, "2026-03-10") || !strings.Contains(m.actionMessage, "feature/demo") {
+		t.Fatalf("actionMessage = %q, want left commit context", m.actionMessage)
+	}
+	if !strings.Contains(m.actionMessage, "2026-03-11") || !strings.Contains(m.actionMessage, "HEAD, master") {
+		t.Fatalf("actionMessage = %q, want right commit context", m.actionMessage)
+	}
+}
+
+func TestTrimPathMiddlePreservesFilename(t *testing.T) {
+	path := "BcusAdmin/Helpers/MetricsDataEnums.cs"
+	trimmed := trimPathMiddle(path, 24)
+	if !strings.Contains(trimmed, "MetricsDataEnums.cs") {
+		t.Fatalf("trimmed path = %q, want filename preserved", trimmed)
+	}
+	if strings.Contains(trimmed, "Helpers/") && strings.Contains(trimmed, "BcusAdmin/") && len(trimmed) >= len(path) {
+		t.Fatalf("trimmed path = %q, expected shortening", trimmed)
+	}
+}
+
+func TestResetDiffCursorToContentStartSkipsHeaderRows(t *testing.T) {
+	m := &model{
+		diff:         headerHeavyDiff,
+		diffViewMode: diffViewPatch,
+		diffLayout:   diffLayoutInline,
+		renderCache:  map[string]renderedDiff{},
+		parsedDiffs:  map[string]render.Diff{},
+	}
+
+	m.resetDiffCursorToContentStart(100)
+	meta := m.currentDiffRowMeta(100)
+	if meta == nil {
+		t.Fatal("expected current diff row metadata")
+	}
+	if got, want := meta.NewLine, 1; got != want {
+		t.Fatalf("new line = %d, want %d", got, want)
+	}
+	if got, want := meta.Kind, render.LineAdd; got != want {
+		t.Fatalf("row kind = %q, want %q", got, want)
 	}
 }
 

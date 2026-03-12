@@ -1,7 +1,13 @@
 #!/usr/bin/env sh
 set -eu
 
-SOURCE_PATH="${1:-bin/better-diff}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+DEFAULT_SOURCE="$SCRIPT_DIR/better-diff"
+if [ ! -f "$DEFAULT_SOURCE" ]; then
+  DEFAULT_SOURCE="bin/better-diff"
+fi
+
+SOURCE_PATH="${1:-$DEFAULT_SOURCE}"
 PREFIX="${PREFIX:-$HOME/bin}"
 TARGET_PATH="$PREFIX/better-diff"
 
