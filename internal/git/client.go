@@ -975,7 +975,11 @@ func OpenFileInEditor(cwd, path string, line int) (string, error) {
 		editor = os.Getenv("EDITOR")
 	}
 	if editor == "" {
-		editor = "code"
+		if _, err := exec.LookPath("code"); err == nil {
+			editor = "code"
+		} else {
+			editor = "vim"
+		}
 	}
 
 	targetPath, err := resolveWorktreePath(cwd, path)
