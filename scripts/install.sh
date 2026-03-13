@@ -8,7 +8,22 @@ if [ ! -f "$DEFAULT_SOURCE" ]; then
 fi
 
 SOURCE_PATH="${1:-$DEFAULT_SOURCE}"
-PREFIX="${PREFIX:-$HOME/bin}"
+
+if [ -z "${PREFIX:-}" ]; then
+  OS="$(uname -s)"
+  if [ "$OS" = "Linux" ]; then
+    printf "Install to ~/.local/bin (recommended) or ~/bin? [~/.local/bin]: "
+    read -r answer
+    case "$answer" in
+      ""|"~/.local/bin") PREFIX="$HOME/.local/bin" ;;
+      "~/bin")           PREFIX="$HOME/bin" ;;
+      *)                 PREFIX="$answer" ;;
+    esac
+  else
+    PREFIX="$HOME/bin"
+  fi
+fi
+
 TARGET_PATH="$PREFIX/better-diff"
 
 if [ ! -f "$SOURCE_PATH" ]; then
